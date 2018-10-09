@@ -1,14 +1,20 @@
 from setuptools import find_packages, setup
+import os 
+dir_path = os.path.dirname(os.path.realpath(__file__))
 
-with open('README.md', 'r') as f:
-    long_description = f.read()
+long_description = """
+Pipelign
+--------
+
+An automated pipeline for multiple sequence alignment.
+"""
 
 setup(
     name='pipelign',
     version='0.1',
     author='Mukarram Hossain',
     author_email='asmmh2@cam.ac.uk',
-    packages=find_packages(exclude=['docs']),
+    packages=find_packages(exclude=[dir_path+'/docs']),
     url='https://github.com/asmmhossain/pipelign',
     license='MIT',
     description='A pipeline for automated alignment',
@@ -18,6 +24,6 @@ setup(
         'ete3'
     ],
     scripts=[
-        'bin/pipelign'
+        dir_path+'/bin/pipelign'
     ]
 )

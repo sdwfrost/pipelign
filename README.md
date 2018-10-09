@@ -1,8 +1,7 @@
 pipelign
 ========
 
-[![PyPI](https://img.shields.io/pypi/v/pipelign.svg)](https://pypi.python.org/pypi/pipelign)
-[![GitHub license](https://img.shields.io/github/license/asmmhossain/pipelign.svg)](./LICENSE.txt)
+[![GitHub license](https://img.shields.io/github/license/asmmhossain/pipelign.svg)](./LICENSE)
 [![Requires.io](https://img.shields.io/requires/github/asmmhossain/pipelign.svg)](https://requires.io/github/asmmhossain/pipelign/requirements/)
 [![Travis](https://img.shields.io/travis/asmmhossain/pipelign.svg)](https://travis-ci.org/asmmhossain/pipelign)
 
@@ -17,6 +16,18 @@ Description
 -----------
 
 \$ A pipeline for automated alignment\$
+
+Dependencies
+------------
+
+- MAFFT
+- HMMER3
+- CD-HIT
+- IQTREE
+
+These can be installed e.g. using conda from the bioconda channel:
+
+    $ conda install mafft hmmer cd-hit iqtree -c bioconda
 
 Installation with pip
 ---------------------

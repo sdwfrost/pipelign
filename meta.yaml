@@ -2,12 +2,9 @@ package:
   name: pipelign
   version: "v0.1"
 
-source:
-  git_rev: "v0.1"
-  git_url: https://github.com/sdwfrost/pipelign.git
-
-channels:
-  - bioconda
+#source:
+#  git_rev: "v0.1"
+#  git_url: https://github.com/sdwfrost/pipelign.git
 
 requirements:
   build:
@@ -16,11 +13,10 @@ requirements:
   run:
     - python
     - biopython
-    - ete3
     - mafft
-    - cd-hit
     - iqtree
     - hmmer
+    - cd-hit
 
 about:
   home: https://github.com/asmmhossain/pipelign
