@@ -1,9 +1,9 @@
 package:
   name: pipelign
-  version: "0.1"
+  version: "v0.1-alpha"
 
 source:
-  git_rev: v0.1
+  git_rev: v0.1-alpha
   git_url: https://github.com/sdwfrost/pipelign.git
 
 requirements:
