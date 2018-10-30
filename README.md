@@ -5,17 +5,17 @@ pipelign
 [![Requires.io](https://img.shields.io/requires/github/asmmhossain/pipelign.svg)](https://requires.io/github/asmmhossain/pipelign/requirements/)
 [![Travis](https://img.shields.io/travis/asmmhossain/pipelign.svg)](https://travis-ci.org/asmmhossain/pipelign)
 
-\$
-
-:   Built from
-    [makenew/python-package](https://github.com/makenew/python-package).
-
-\$
+Built from [makenew/python-package](https://github.com/makenew/python-package).
 
 Description
 -----------
 
-\$ A pipeline for automated alignment\$
+A pipeline for automated multiple sequence alignment, particularly of viral sequences.
+
+Citation
+--------
+
+Pipelign: an alignment pipeline for viral sequences. A.S.Md.M. Hossain and S.D.W.Frost, in preparation.
 
 Usage
 -----
