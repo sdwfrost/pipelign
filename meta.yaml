@@ -13,6 +13,8 @@ requirements:
   run:
     - python
     - biopython
+    - ete3
+    - joblib
     - mafft
     - iqtree
     - hmmer

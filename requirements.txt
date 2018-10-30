@@ -1,3 +1,4 @@
 biopython
+joblib
 ete3
 
