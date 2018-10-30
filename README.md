@@ -67,6 +67,8 @@ optional arguments:
                         Exclude clusters from final alignment
 ```
 
+In addition, a utility to convert GenBank files into plain FASTA files with the accession as header is included as `gb2fas`.
+
 Dependencies
 ------------
 

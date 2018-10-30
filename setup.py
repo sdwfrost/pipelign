@@ -24,6 +24,7 @@ setup(
         'ete3'
     ],
     scripts=[
-        dir_path+'/bin/pipelign'
+        dir_path+'/bin/pipelign',
+        dir_path+'/bin/gb2fas'
     ]
 )

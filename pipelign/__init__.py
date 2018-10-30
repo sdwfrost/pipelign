@@ -75,13 +75,13 @@ def genCodeLimit(x):
 
 #****************************************
 
-def cZip(cDir,tName):
+def cZip(cDir,tName,zName):
     '''
     creates a zip file of the temporary directory
     '''  
     os.chdir(cDir)
   
-    zName = 'pipelign.' + time.strftime('%Y-%m-%d-%H%M%S') 
+    #zName = 'pipelign.' + time.strftime('%Y-%m-%d-%H%M%S') 
     try:
         shutil.make_archive(zName,'zip',tName)
     except OSError as e: 
