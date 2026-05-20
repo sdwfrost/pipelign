@@ -1,30 +1,140 @@
-pipelign
-========
+# pipelign
 
-[![GitHub license](https://img.shields.io/github/license/asmmhossain/pipelign.svg)](./LICENSE)
-[![Requires.io](https://img.shields.io/requires/github/asmmhossain/pipelign.svg)](https://requires.io/github/asmmhossain/pipelign/requirements/)
-[![Travis](https://img.shields.io/travis/asmmhossain/pipelign.svg)](https://travis-ci.org/asmmhossain/pipelign)
+A pipeline for automated multiple sequence alignment, particularly of viral
+sequences.
 
-Built from [makenew/python-package](https://github.com/makenew/python-package).
+Pipelign accepts FASTA input, separates full-length sequences from fragments,
+clusters related sequences, builds cluster alignments and HMMs, assigns
+fragments back to clusters, and produces a final multiple sequence alignment.
 
-Description
------------
+## Supported Python versions
 
-A pipeline for automated multiple sequence alignment, particularly of viral sequences.
+The Python package supports Python 3.10 through 3.14. Runtime bioinformatics
+executables are installed separately from conda-forge/bioconda or your system
+package manager.
 
-Citation
---------
+## External dependencies
 
-Pipelign: an alignment pipeline for viral sequences. A.S.Md.M. Hossain and S.D.W.Frost, in preparation.
+Pipelign shells out to these tools:
 
-Usage
------
+| Executable(s) | Conda package | Used for |
+| --- | --- | --- |
+| `mafft` | `mafft` | Sequence alignment and profile merging |
+| `hmmbuild`, `hmmpress`, `hmmscan`, `nhmmscan` | `hmmer` | HMM building and sequence/profile search |
+| `cd-hit`, `cd-hit-est` | `cd-hit` | Sequence clustering |
+| `iqtree` or `iqtree2` | `iqtree` | Tree inference |
+| `makeblastdb`, `blastn`, `blastp` | `blast` | Fragment-to-cluster assignment |
+| `parallel` | `parallel` | GNU parallel mode (`-r G`) |
 
-```sh
+Create an environment with micromamba:
+
+```bash
+micromamba create -n pipelign -c conda-forge -c bioconda \
+  python=3.12 mafft hmmer cd-hit iqtree blast parallel
+micromamba activate pipelign
+```
+
+Or with conda:
+
+```bash
+conda create -n pipelign -c conda-forge -c bioconda \
+  python=3.12 mafft hmmer cd-hit iqtree blast parallel
+conda activate pipelign
+```
+
+Or with pixi:
+
+```bash
+pixi init pipelign-env
+cd pipelign-env
+pixi add -c conda-forge -c bioconda python=3.12 mafft hmmer cd-hit iqtree blast parallel
+pixi shell
+```
+
+## Install the Python package
+
+For agent-friendly use, install the command as a uv tool from a checkout:
+
+```bash
+git clone https://github.com/asmmhossain/pipelign.git
+cd pipelign
+uv tool install .
+```
+
+Update or remove the tool with:
+
+```bash
+uv tool upgrade pipelign
+uv tool uninstall pipelign
+```
+
+For editable development inside an activated conda/micromamba/pixi environment:
+
+```bash
+uv pip install -e ".[dev]"
+```
+
+Plain pip also works:
+
+```bash
+python -m pip install .
+python -m pip install -e ".[dev]"
+```
+
+## Copilot agent skill
+
+Install the optional personal Copilot skill so agents get the recommended
+pipelign workflow when relevant:
+
+```bash
+pipelign skill install
+```
+
+If Copilot CLI is already running, reload skills with `/skills reload` and
+check it with `/skills info pipelign`.
+
+## Check an installation
+
+Run `pipelign-doctor` with the same alphabet, run mode, and stage you plan to
+use:
+
+```bash
+pipelign-doctor -a dna -r G -n 5
+```
+
+Use `-r J` to check Joblib mode without GNU parallel:
+
+```bash
+pipelign-doctor -a dna -r J -n 5
+```
+
+## Usage
+
+Basic DNA alignment:
+
+```bash
+pipelign -i input.fasta -o aligned.fasta -d pipelign-work -a dna -r G -n 5
+```
+
+Run without GNU parallel:
+
+```bash
+pipelign -i input.fasta -o aligned.fasta -d pipelign-work -a dna -r J -n 5
+```
+
+Convert GenBank records to FASTA:
+
+```bash
+gb2fas input.gb output.fasta
+```
+
+### Main command reference
+
+```text
 usage: pipelign [-h] -i INFILE -o OUTFILE [-t LENTHR] [-a {dna,aa,rna}] [-f]
                 [-b] [-z] [-p SIMPER] [-r {J,G}] [-e {P,C}] [-q THREAD]
                 [-s MITERATELONG] [-m MITERATEMERGE] -d OUTDIR [-c]
-                [-w AMBIGPER] [-n {1,2,3,4,5,6}] [-x]
+                [-w AMBIGPER] [-n {1,2,3,4,5}] [-x]
 
 Pipelign: creates multiple sequence alignment from FASTA formatted sequence file
 
@@ -46,7 +156,7 @@ optional arguments:
   -r {J,G}, --run {J,G}
                         Run either (J)oblib/(G)NU parallel version (default: G)
   -e {P,C}, --merge {P,C}
-                        Merge using (P)arallel/(C)onsensus strategy  (default: P)
+                        Merge using (P)arallel/(C)onsensus strategy (default: P)
   -q THREAD, --thread THREAD
                         Number of CPU/threads to use (default: 1)
   -s MITERATELONG, --mIterateLong MITERATELONG
@@ -58,8 +168,8 @@ optional arguments:
   -c, --clearExistingDirectory
                         Remove files from existing output directory
   -w AMBIGPER, --ambigPer AMBIGPER
-                        Proportion of ambiguous characters allowed in the long sequences (default: 0.1)
-  -n {1,2,3,4,5,6}, --stage {1,2,3,4,5,6}
+                        Proportion of ambiguous characters allowed in long sequences
+  -n {1,2,3,4,5}, --stage {1,2,3,4,5}
                         1  Make cluster alignments and HMM of long sequences
                         2  Align long sequences only
                         3  Assign fragments to clusters
@@ -69,109 +179,50 @@ optional arguments:
                         Exclude clusters from final alignment
 ```
 
-In addition, a utility to convert GenBank files into plain FASTA files with the accession as header is included as `gb2fas`.
+## Changes from the original package
 
-Dependencies
-------------
+- Modern Python packaging via `pyproject.toml`.
+- Python 3.10-3.14 compatibility.
+- `ete4` replaces `ete3`.
+- Biopython consensus generation uses `Bio.motifs` instead of deprecated
+  `dumb_consensus()`.
+- `pipelign`, `gb2fas`, and `pipelign-doctor` are installed as console scripts.
+- `pipelign-doctor` reports missing external executables and install packages.
+- `pipelign skill install` installs optional Copilot CLI workflow guidance.
 
-- MAFFT
-- HMMER3
-- CD-HIT
-- IQTREE
-- BLAST
+## Development
 
-These can be installed e.g. using conda from the bioconda channel. `pipelign` has been tested with Python 3.10.
+Install development dependencies:
 
-    $ conda create -n pipelign -c bioconda -c conda-forge python==3.10
-    $ conda activate pipelign
-    $ conda install joblib six parallel blast iqtree mafft cd-hit hmmer -c bioconda -c conda-forge
+```bash
+uv pip install -e ".[dev]"
+```
 
-Installation with pip
----------------------
+Run tests and syntax checks:
 
-Install it directly using pip (using the above environment) with
+```bash
+make lint
+make test
+```
 
-    $ git clone https://github.com/asmmhossain/pipelign
-    $ cd pipelign
-    $ pip install .
+Build and check a distribution:
 
-Installation with setuptools
-----------------------------
+```bash
+python -m build
+python -m twine check dist/*
+```
 
-    $ python3 setup.py install
+## Citation
 
-Development and Testing
------------------------
+Pipelign: an alignment pipeline for viral sequences. A.S.Md.M. Hossain and
+S.D.W. Frost, in preparation.
 
-### Source Code
-
-The [pipelign source](https://github.com/asmmhossain/pipelign) is hosted
-on GitHub. Clone the project with
-
-    $ git clone https://github.com/asmmhossain/pipelign.git
-
-### Requirements
-
-You will need [Python 3](https://www.python.org/) with
-[pip](https://pip.pypa.io/).
-
-Install the development dependencies with
-
-    $ pip install -r requirements.devel.txt
-
-### Building a conda package
-
-Installation with conda
------------------------
-
-First create an environment.
-
-    $ conda create -n pipelign python=3.10
-
-Activate the environment.
-
-    $ source activate pipelign
-
-Install conda-build:
-
-    $ conda install conda-build
-
-Run conda.
-
-    $ conda-build . -c bioconda
-
-### Tests
-
-Lint code with
-
-    $ python setup.py lint
-
-Run tests with
-
-    $ python setup.py test
-
-Contributing
-------------
-
-Please submit and comment on bug reports and feature requests.
-
-To submit a patch:
-
-1.  Fork it (<https://github.com/asmmhossain/pipelign/fork>).
-2.  Create your feature branch (`git checkout -b my-new-feature`).
-3.  Make changes. Write and run tests.
-4.  Commit your changes (`git commit -am 'Add some feature'`).
-5.  Push to the branch (`git push origin my-new-feature`).
-6.  Create a new Pull Request.
-
-License
--------
+## License
 
 This Python package is licensed under the MIT license.
 
-Warranty
---------
+## Warranty
 
-This software is provided \"as is\" and without any express or implied
-warranties, including, without limitation, the implied warranties of
-merchantibility and fitness for a particular purpose.
+This software is provided "as is" and without any express or implied warranties,
+including, without limitation, the implied warranties of merchantability and
+fitness for a particular purpose.

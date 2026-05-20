@@ -5,12 +5,180 @@ A pipeline for automated alignment
 import sys, os, shutil, subprocess, argparse, textwrap, stat
 from Bio import SeqIO, Phylo
 from Bio import AlignIO
-from Bio.Align import AlignInfo
+from Bio.Align import MultipleSeqAlignment
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+from Bio.motifs import Motif
 import tempfile
 import time
 import joblib
 import math
-from ete3 import Tree
+from ete4 import Tree
+
+NUCLEOTIDE_CONSENSUS_ALPHABET = "ACGTURYSWKMBDHVN"
+PROTEIN_CONSENSUS_ALPHABET = "ACDEFGHIKLMNPQRSTVWYBXZJUO"
+
+EXTERNAL_TOOL_GROUPS = {
+    "common": [("mafft",), ("hmmbuild",), ("hmmpress",), ("iqtree", "iqtree2")],
+    "gnu_parallel": [("parallel",)],
+    "dna_cluster": [("cd-hit-est",)],
+    "aa_cluster": [("cd-hit",)],
+    "dna_search": [("makeblastdb",), ("blastn",), ("nhmmscan",)],
+    "aa_search": [("makeblastdb",), ("blastp",), ("hmmscan",)],
+}
+
+EXTERNAL_TOOL_DETAILS = {
+    ("mafft",): ("mafft", "sequence alignment and profile merging", "stages 1-5"),
+    ("hmmbuild",): ("hmmer", "building cluster HMMs", "stages 1-5"),
+    ("hmmpress",): ("hmmer", "indexing the HMM database", "stages 1-5"),
+    ("iqtree", "iqtree2"): ("iqtree", "cluster-representative tree inference", "stages 1-5"),
+    ("parallel",): ("parallel", "GNU parallel execution", "when -r G"),
+    ("cd-hit-est",): ("cd-hit", "DNA/RNA sequence clustering", "stages 1-5 for dna/rna"),
+    ("cd-hit",): ("cd-hit", "protein sequence clustering", "stages 1-5 for aa"),
+    ("makeblastdb",): ("blast", "BLAST database construction", "stages 3-5"),
+    ("blastn",): ("blast", "DNA/RNA fragment search", "stages 3-5 for dna/rna"),
+    ("blastp",): ("blast", "protein fragment search", "stages 3-5 for aa"),
+    ("nhmmscan",): ("hmmer", "DNA/RNA HMM fragment search", "stages 3-5 for dna/rna"),
+    ("hmmscan",): ("hmmer", "protein HMM fragment search", "stages 3-5 for aa"),
+}
+
+
+def _first_available_executable(*names):
+    for name in names:
+        resolved = shutil.which(name)
+        if resolved:
+            return resolved
+    return None
+
+
+def _format_tool_names(names):
+    return " or ".join(names)
+
+
+def external_tool_details(names):
+    package, purpose, stages = EXTERNAL_TOOL_DETAILS.get(names, ("unknown", "pipelign execution", "selected stages"))
+    return {
+        "names": names,
+        "display": _format_tool_names(names),
+        "package": package,
+        "purpose": purpose,
+        "stages": stages,
+    }
+
+
+def required_external_tools(alphabet="dna", run="G", stage=5):
+    tools = list(EXTERNAL_TOOL_GROUPS["common"])
+    tools.extend(EXTERNAL_TOOL_GROUPS["aa_cluster" if alphabet == "aa" else "dna_cluster"])
+
+    if run == "G":
+        tools.extend(EXTERNAL_TOOL_GROUPS["gnu_parallel"])
+
+    if stage in (3, 4, 5):
+        tools.extend(EXTERNAL_TOOL_GROUPS["aa_search" if alphabet == "aa" else "dna_search"])
+
+    seen = set()
+    unique = []
+    for names in tools:
+        if names not in seen:
+            seen.add(names)
+            unique.append(names)
+    return unique
+
+
+def missing_external_tools(alphabet="dna", run="G", stage=5):
+    return [names for names in required_external_tools(alphabet, run, stage) if _first_available_executable(*names) is None]
+
+
+def check_external_dependencies(alphabet="dna", run="G", stage=5):
+    missing = missing_external_tools(alphabet, run, stage)
+    if not missing:
+        return
+
+    msg = "\nERROR: Missing required external executable(s):\n"
+    for names in missing:
+        details = external_tool_details(names)
+        msg += "  - {display} ({purpose}; install package: {package})\n".format(**details)
+    msg += "Install the missing tools with conda/micromamba/pixi from bioconda/conda-forge, then rerun pipelign.\n"
+    sys.exit(msg)
+
+
+def _node_is_leaf(node):
+    is_leaf = getattr(node, "is_leaf")
+    return is_leaf() if callable(is_leaf) else bool(is_leaf)
+
+
+def _read_named_tree(tree_file):
+    return Tree(tree_file, parser=1)
+
+
+def _find_tree_node(tree, name):
+    matches = list(tree.search_nodes(name=name))
+    if not matches:
+        raise ValueError("Tree node %r was not found" % name)
+    if len(matches) > 1:
+        raise ValueError("Tree node name %r is not unique" % name)
+    return matches[0]
+
+
+def _iter_tree_leaves(tree):
+    leaves = getattr(tree, "leaves", None)
+    if callable(leaves):
+        return list(leaves())
+    return [node for node in tree.traverse() if _node_is_leaf(node)]
+
+
+def consensus_from_alignment(aln, alphabet):
+    default_alphabet = PROTEIN_CONSENSUS_ALPHABET if alphabet == "aa" else NUCLEOTIDE_CONSENSUS_ALPHABET
+    ambiguous = "X" if alphabet == "aa" else "N"
+    records = []
+    observed = set(default_alphabet)
+    lengths = set()
+
+    for record in aln:
+        sequence = str(record.seq).upper()
+        lengths.add(len(sequence))
+        observed.update(char for char in sequence if char != "-")
+        records.append(SeqRecord(Seq(sequence), id=record.id, description=""))
+
+    if not records:
+        raise ValueError("cannot calculate consensus from an empty alignment")
+    if len(lengths) != 1:
+        raise ValueError("cannot calculate consensus from sequences with different lengths")
+    aln_len = lengths.pop()
+    if aln_len == 0:
+        raise ValueError("cannot calculate consensus from an alignment with no columns")
+    if all(char == "-" for record in records for char in str(record.seq)):
+        return ambiguous * aln_len
+
+    gap_only_columns = {
+        idx
+        for idx in range(aln_len)
+        if all(str(record.seq)[idx] == "-" for record in records)
+    }
+    if gap_only_columns:
+        records = [
+            SeqRecord(
+                Seq("".join(char for idx, char in enumerate(str(record.seq)) if idx not in gap_only_columns)),
+                id=record.id,
+                description="",
+            )
+            for record in records
+        ]
+
+    motif_alphabet = "".join(sorted(observed - {"-"}))
+    normalized = MultipleSeqAlignment(records)
+    consensus = str(Motif(motif_alphabet, normalized.alignment).counts.calculate_consensus(identity=0.5))
+    if gap_only_columns:
+        consensus_parts = []
+        consensus_idx = 0
+        for idx in range(aln_len):
+            if idx in gap_only_columns:
+                consensus_parts.append(ambiguous)
+            else:
+                consensus_parts.append(consensus[consensus_idx])
+                consensus_idx += 1
+        consensus = "".join(consensus_parts)
+    return consensus.replace("-", ambiguous)
 
 #************************************
 class Struct:
@@ -67,7 +235,7 @@ def mergeType(x):
 
 def genCodeLimit(x):
     x = int(x)
-    gCodes = list(1,2,3,4,5,6,9,10,11,12,13,14,16,21,22,23,24,25)
+    gCodes = [1,2,3,4,5,6,9,10,11,12,13,14,16,21,22,23,24,25]
     if x not in gCodes:
         raise argparse.ArgumentTypeError('%r is not a valid genetic code' % (x,))
     else:
@@ -99,7 +267,7 @@ def concatLogFiles(original,newLog):
 
     lh = open(original,'a')
 
-    with open(newLog,'rU') as f:
+    with open(newLog,'r') as f:
         for line in f:
             lh.write(line)
 
@@ -347,7 +515,7 @@ def separateFullFragment(seqFile, lenThr, longName, fragName):
     maxLen = 0
 
     # get maximum length of the input sequences
-    handle = open(seqFile, "rU")
+    handle = open(seqFile, "r")
     for record in SeqIO.parse(handle, "fasta"):
         if len(record.seq) > maxLen:
             maxLen = len(record.seq)
@@ -360,7 +528,7 @@ def separateFullFragment(seqFile, lenThr, longName, fragName):
     fragS = []
 
     # create separate lists for long sequences and fragments
-    handle = open(seqFile, "rU")
+    handle = open(seqFile, "r")
     for record in SeqIO.parse(handle, "fasta"):
         if len(record.seq) < minLengthLong:
             fragS.append(record)
@@ -447,7 +615,7 @@ def runCDHIT(longName,alphabet,per,thread):
 
     # count number of sequences in long sequence file
     seqCount = 0
-    handle = open(longName,'rU')
+    handle = open(longName,'r')
     for record in SeqIO.parse(handle,'fasta'):
         seqCount += 1
 
@@ -543,7 +711,8 @@ def makeClusters(longName,cName):
 
     #cName = 'grp.clstr'
 
-    lines = [line.strip('\n') for line in open(cName,'rU')] # read cluster file
+    with open(cName,'r') as fh:
+        lines = [line.strip('\n') for line in fh] # read cluster file
 
     start = 0 # flag for the beginning of first cluster list
 
@@ -614,7 +783,7 @@ def addClusterNumberToReps(repName,lstFile,outFile):
     cID = [] # sequence ids
     cNum = [] # cluster numbers
 
-    with open(lstFile,'rU') as f:
+    with open(lstFile,'r') as f:
         for line in f:
             words = line.split()
             cID.append(words[0])
@@ -649,10 +818,14 @@ def makeIQTree(alnFile,thread,alpha):
 
     #print('\nCreating IQ-TREE from %s' % alnFile)
 
+    iqtree = _first_available_executable("iqtree", "iqtree2")
+    if iqtree is None:
+        sys.exit("\nERROR: Missing required external executable: iqtree or iqtree2\n")
+
     if alpha == 'dna' or alpha == 'rna':
-        cl = ['iqtree', '-s', alnFile, '-m', 'GTR+R4', '-nt', str(thread)]
+        cl = [iqtree, '-s', alnFile, '-m', 'GTR+R4', '-nt', str(thread)]
     elif alpha == 'aa':
-        cl = ['iqtree', '-s', alnFile, '-m', 'WAG', '-nt', str(thread)]
+        cl = [iqtree, '-s', alnFile, '-m', 'WAG', '-nt', str(thread)]
 
     try:
         subprocess.check_call(cl,stdout=lh,stderr=lh)
@@ -686,16 +859,18 @@ def makeMidPointRootTree(treeFile):
 
 def drawAsciiTree(treeFile):
     '''
-      - draws ASCII tree on the console using ete3
+      - draws ASCII tree on the console
     '''
 
-    # Read the tree in newick format
-    #tree = Phylo.read(treeFile,'newick')
-
-    #Phylo.draw_ascii(tree)
-    tree = Tree(treeFile)
-    #print(tree.get_ascii(show_internal=True))
-    print(tree)
+    if not os.path.exists(treeFile):
+        raise ValueError("tree file <%s> does not exist" % treeFile)
+    if os.path.getsize(treeFile) == 0:
+        raise ValueError("tree file <%s> is empty" % treeFile)
+    try:
+        tree = Phylo.read(treeFile,'newick')
+        Phylo.draw_ascii(tree)
+    except Exception as exc:
+        raise ValueError("could not draw Newick tree <%s>: %s" % (treeFile, exc)) from exc
 
 #***********************************************************************
 def alnLongSequenceClustersGNUParallel(nClusters,thread,mIterL):
@@ -931,11 +1106,11 @@ def buildHMMdb(nClusters):
     dbName = 'pipelign.hmm'
 
     # write all HMMs in one file
-    fh = open(dbName,'w')
-    for i in range(nClusters):
-        hName = 'long.' + str(i) + '.hmm'
-        shutil.copyfileobj(open(hName,'r'),fh)
-    fh.close()
+    with open(dbName,'w') as fh:
+        for i in range(nClusters):
+            hName = 'long.' + str(i) + '.hmm'
+            with open(hName,'r') as hh:
+                shutil.copyfileobj(hh,fh)
 
     # create HMM database
     cl = ['hmmpress', '-f', dbName]
@@ -990,7 +1165,7 @@ def addNameToInternalNodes(tree):
     # annotate names to internal nodes
     edge = 0
     for node in tree.traverse():
-        if not node.is_leaf():
+        if not _node_is_leaf(node):
             node.name = "NODE_%d" %edge
             edge += 1
     return tree
@@ -999,7 +1174,7 @@ def addNameToInternalNodes(tree):
 
 def changeLeafNamesToClusterNames(tree,tp):
     # annotate name of the leaf nodes to get cluster names
-    for leaf in tree:
+    for leaf in _iter_tree_leaves(tree):
         lName = tp + '.' + leaf.name.split('_')[-1]
         leaf.name = lName
         #print(leaf.name)
@@ -1157,7 +1332,7 @@ def mergePair(aln1,aln2,alnFile,thread,mIterLong,log,p=None):
 
 def merge_gnu_parallel(repTree,tp,thread,mIterL,log):
     # read the tree
-    tree = Tree(repTree,format=1)
+    tree = _read_named_tree(repTree)
 
     # annotate internal node names
     tree = addNameToInternalNodes(tree)
@@ -1170,21 +1345,27 @@ def merge_gnu_parallel(repTree,tp,thread,mIterL,log):
         tree = changeLeafNamesToClusterNames(tree,'long')
     elif tp == 'all':
         tree = changeLeafNamesToClusterNames(tree,'cls')
-    print(tree.get_ascii(show_internal=True))
+    print(tree)
 
     # get cherries and update trees
     while(len(tree) > 1):
         cherries = [] # empty list for cherries
         iNodes = [] # empty list for internal nodes
-        for leaf in tree:
-            if len(leaf.up) == 2: # two leaf nodes
+        for leaf in _iter_tree_leaves(tree):
+            parent = getattr(leaf, "up", None)
+            if parent is None:
+                continue
+            children = list(parent)
+            if len(children) == 2 and all(_node_is_leaf(child) for child in children): # two leaf nodes
                 #print(leaf.name)
                 #print(leaf.up)
                 cherries.append(leaf.name)
-                if leaf.up.name not in iNodes:
-                    iNodes.append(leaf.up.name)
+                if parent.name not in iNodes:
+                    iNodes.append(parent.name)
 
         # call merge()
+        if not cherries:
+            raise RuntimeError("no mergeable cherries found in <%s>" % repTree)
         if len(cherries) % 2 != 0:
             sys.exit('incomplete cherries found: exiting')
         # even number of leafs in cherries list
@@ -1198,7 +1379,7 @@ def merge_gnu_parallel(repTree,tp,thread,mIterL,log):
 
         # get the pointers to the cherries leafs and remove them
         for cherry in cherries:
-            l = tree.search_nodes(name=cherry)[0]
+            l = _find_tree_node(tree, cherry)
             #print(l)
             #print(tree.get_ascii(show_internal=True))
             l.detach()
@@ -1261,16 +1442,16 @@ def mergeConsensus(numClusters,oName,tp,mArgs,log):
     ## create consensus from each of the cluster alignments and create a sequence file
     for i in range(numClusters):
         aName = tp + '.' + str(i) + '.aln'
-        aln = AlignIO.read(open(aName),'fasta')
-        con = AlignInfo.SummaryInfo(aln).dumb_consensus(threshold=0.5, ambiguous='N')
+        with open(aName) as ah:
+            aln = AlignIO.read(ah,'fasta')
+        con = consensus_from_alignment(aln, mArgs.alphabet)
 
         st += '>' + aName + '\n'
         st += str(con) + '\n'
 
     ## write the consensus sequence file
-    fh = open('consensus.fas','w')
-    fh.write(st)
-    fh.close()
+    with open('consensus.fas','w') as fh:
+        fh.write(st)
 
     msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
     msg += ' Aligning consensus sequences from each clusters\n'
@@ -1282,35 +1463,33 @@ def mergeConsensus(numClusters,oName,tp,mArgs,log):
     ## read in the consensus alignment
     ## get positions for gaps in each sequence
     ## add gaps to their respective positions in the cluster alignments
-    fh = open(oName,'w') # create the output alignment file
+    with open(oName,'w') as fh: # create the output alignment file
+        # read consensus alignment
+        with open('consensus.aln') as ch:
+            aln = AlignIO.read(ch,'fasta')
 
-    # read consensus alignment
-    aln = AlignIO.read(open('consensus.aln'),'fasta')
+        for i in range(numClusters):
+            indices = [j for j, x in enumerate(aln[i].seq) if x == "-"]
+            cName = aln[i].id
 
-    for i in range(numClusters):
-        indices = [j for j, x in enumerate(aln[i].seq) if x == "-"]
-        cName = aln[i].id
+            # read in the cluster alignment file
+            with open(cName) as cHandle:
+                seqs = SeqIO.parse(cHandle,'fasta')
 
-        # read in the cluster alignment file
-        seqs = SeqIO.parse(open(cName),'fasta')
+                for seq in seqs:
+                    # create a string object to write in the file
+                    st = '>' + seq.id + '\n'
 
+                    start = 0
 
-        for seq in seqs:
-            # create a string object to write in the file
-            st = '>' + seq.id + '\n'
+                    for j in range(len(indices)):
+                        end = indices[j] - j
+                        st += seq.seq[start:end] + '-'
+                        start = end
 
-            start = 0
+                    st += seq.seq[start:] + '\n'
 
-            for j in range(len(indices)):
-                end = indices[j] - j
-                st += seq.seq[start:end] + '-'
-                start = end
-
-            st += seq.seq[start:] + '\n'
-
-            fh.write(str(st))
-
-    fh.close()
+                    fh.write(str(st))
 
 
 #***********************************************************************
@@ -1455,7 +1634,8 @@ def runBlast(log,mArgs):
 
 
     # parse blast out file to create fragment clusterList file
-    lines = [line.strip() for line in open('frag.blast.txt','rU')]
+    with open('frag.blast.txt','r') as fh:
+        lines = [line.strip() for line in fh]
 
     st = '' # holds string for frag.ClusterList.txt
 
@@ -1535,7 +1715,8 @@ def createFragmentClusters(numClusters):
 
 
     # read in the cluster assignment file
-    clsList = [line.strip() for line in open('frag.ClusterList.txt','r')]
+    with open('frag.ClusterList.txt','r') as fh:
+        clsList = [line.strip() for line in fh]
 
     ids = [] # holds IDs of the assigned fragments
     cnum= [] # holds the cluster numbers
@@ -1593,7 +1774,8 @@ def getHMMclusters():
     fh = open('frag.ClusterList.txt','a')
 
     # read in the hmm.out file
-    hmmOut = [line.strip() for line in open('hmm.out','rU')]
+    with open('hmm.out','r') as fh:
+        hmmOut = [line.strip() for line in fh]
 
     qids = [] # list all matched query IDs from output file
     hids = [] # list the hmm that they matched with
@@ -1610,7 +1792,7 @@ def getHMMclusters():
 
     # search each of the fragment ids in the qids list to find a match
     # get the first match as HMM search sorted the output based on best match
-    handle = open('frag.noBlast.fas','rU')
+    handle = open('frag.noBlast.fas','r')
     for seq in SeqIO.parse(handle,'fasta'):
         if seq.id in qids: # if the id matched
             ind = qids.index(seq.id)
@@ -1651,7 +1833,7 @@ def assignClusterstoFrags(numClusters,numFrag,mArgs):
 
             noMatchFrags = [] # hold fragments not matching in BLAST
 
-            handle = open('frag.fas','rU')
+            handle = open('frag.fas','r')
             for seq in SeqIO.parse(handle,'fasta'):
                 if seq.id not in mIds:
                     noMatchFrags.append(seq)
@@ -1817,7 +1999,8 @@ def excludeClustersFromalignment(oAln,xAln):
     exList = list() # contains list of sequences for exclusion
 
     # read in the long cluster list file to list sequences for exclusion
-    longSeqs = [line.strip() for line in open('long.ClusterList.txt','r')]
+    with open('long.ClusterList.txt','r') as fh:
+        longSeqs = [line.strip() for line in fh]
     for lSeq in longSeqs:
         words = lSeq.split()
         if words[1] in inStr:
@@ -1826,7 +2009,8 @@ def excludeClustersFromalignment(oAln,xAln):
 
     if checkPresenceOfFile('frag.ClusterList.txt'):
         # read in the fragment cluster list file to list fragments for exclusion
-        fragSeqs = [line.strip() for line in open('frag.ClusterList.txt','r')]
+        with open('frag.ClusterList.txt','r') as fh:
+            fragSeqs = [line.strip() for line in fh]
         for fSeq in fragSeqs:
             words = fSeq.split()
             if words[1] in inStr:
@@ -2038,7 +2222,7 @@ def validateIterateLong(parser,longIter):
         parser.error('-s appears several times')
 
 #************************************************************************
-def getArguments():
+def getArguments(argv=None):
     '''
         Parses all the command line arguments from the user
     '''
@@ -2063,7 +2247,7 @@ def getArguments():
     parser.add_argument('-d', '--outDir', required=True, help="Name for output directory to hold intermediate files",action=UniqueStore)
     parser.add_argument('-c', '--clearExistingDirectory', help='Remove files from existing output directory', action="store_true")
     parser.add_argument('-w', '--ambigPer', type=float, help="Proportion of ambiguous characters allowed in the long sequences (default: 0.1)", action='append')
-    parser.add_argument('-n', '--stage', type=int,default=5, choices=[1,2,3,4,5,6],
+    parser.add_argument('-n', '--stage', type=int,default=5, choices=[1,2,3,4,5],
         help=textwrap.dedent('''\
         1  Make cluster alignments and HMM of long sequences
         2  Align long sequences only
@@ -2074,7 +2258,7 @@ def getArguments():
 
     parser.add_argument('-x', '--excludeClusters', help='Exclude clusters from final alignment', action="store_true")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # check arguments for validation
 

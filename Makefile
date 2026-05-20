@@ -1,14 +1,14 @@
 all: lint test
 
 lint:
-	@python setup.py lint
+	@python -m compileall -q pipelign bin
 
 release:
 	@rm -rf build dist
-	@python setup.py sdist bdist_wheel
+	@python -m build
 	@twine upload dist/*
 
 test:
-	@python setup.py test
+	@pytest
 
 .PHONY: docs test
