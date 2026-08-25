@@ -9,7 +9,7 @@ from pipelign import _first_available_executable, external_tool_details, require
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Check external executables required by pipelign.")
     parser.add_argument("-a", "--alphabet", choices=["dna", "rna", "aa"], default="dna")
-    parser.add_argument("-r", "--run", choices=["G", "J"], default="G", help="Parallel mode: GNU parallel (G) or Joblib (J)")
+    parser.add_argument("-r", "--run", choices=["G", "J"], default="G", help="Parallel mode: built-in subprocess executor (G) or Joblib (J)")
     parser.add_argument("-n", "--stage", type=int, choices=[1, 2, 3, 4, 5], default=5)
     args = parser.parse_args(argv)
 

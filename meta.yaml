@@ -22,7 +22,6 @@ requirements:
     - hmmer
     - cd-hit
     - blast
-    - parallel
 
 about:
   home: https://github.com/asmmhossain/pipelign

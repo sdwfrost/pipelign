@@ -24,13 +24,12 @@ Pipelign shells out to these tools:
 | `cd-hit`, `cd-hit-est` | `cd-hit` | Sequence clustering |
 | `iqtree` or `iqtree2` | `iqtree` | Tree inference |
 | `makeblastdb`, `blastn`, `blastp` | `blast` | Fragment-to-cluster assignment |
-| `parallel` | `parallel` | GNU parallel mode (`-r G`) |
 
 Create an environment with micromamba:
 
 ```bash
 micromamba create -n pipelign -c conda-forge -c bioconda \
-  python=3.12 mafft hmmer cd-hit iqtree blast parallel
+  python=3.12 mafft hmmer cd-hit iqtree blast
 micromamba activate pipelign
 ```
 
@@ -38,7 +37,7 @@ Or with conda:
 
 ```bash
 conda create -n pipelign -c conda-forge -c bioconda \
-  python=3.12 mafft hmmer cd-hit iqtree blast parallel
+  python=3.12 mafft hmmer cd-hit iqtree blast
 conda activate pipelign
 ```
 
@@ -47,7 +46,7 @@ Or with pixi:
 ```bash
 pixi init pipelign-env
 cd pipelign-env
-pixi add -c conda-forge -c bioconda python=3.12 mafft hmmer cd-hit iqtree blast parallel
+pixi add -c conda-forge -c bioconda python=3.12 mafft hmmer cd-hit iqtree blast
 pixi shell
 ```
 
@@ -102,7 +101,7 @@ use:
 pipelign-doctor -a dna -r G -n 5
 ```
 
-Use `-r J` to check Joblib mode without GNU parallel:
+Use `-r J` to check Joblib mode:
 
 ```bash
 pipelign-doctor -a dna -r J -n 5
@@ -116,7 +115,7 @@ Basic DNA alignment:
 pipelign -i input.fasta -o aligned.fasta -d pipelign-work -a dna -r G -n 5
 ```
 
-Run without GNU parallel:
+Run with Joblib:
 
 ```bash
 pipelign -i input.fasta -o aligned.fasta -d pipelign-work -a dna -r J -n 5
@@ -154,7 +153,7 @@ optional arguments:
   -p SIMPER, --simPer SIMPER
                         Percent sequence similarity for clustering (default: 0.8)
   -r {J,G}, --run {J,G}
-                        Run either (J)oblib/(G)NU parallel version (default: G)
+                        Run either (J)oblib or built-in concurrent mode (G, default)
   -e {P,C}, --merge {P,C}
                         Merge using (P)arallel/(C)onsensus strategy (default: P)
   -q THREAD, --thread THREAD
@@ -189,6 +188,11 @@ optional arguments:
 - `pipelign`, `gb2fas`, and `pipelign-doctor` are installed as console scripts.
 - `pipelign-doctor` reports missing external executables and install packages.
 - `pipelign skill install` installs optional Copilot CLI workflow guidance.
+- Built-in mode uses bounded Python-managed subprocess concurrency and does not
+  require GNU Parallel.
+- Every run writes `pipelign-run.json`; use `--resume` to reuse validated
+  artifacts from a compatible interrupted run.
+- `-z` writes an archive next to the intermediate directory after success.
 
 ## Development
 

@@ -2,7 +2,9 @@
 A pipeline for automated alignment
 """
 
-import sys, os, shutil, subprocess, argparse, textwrap, stat
+import sys, os, shutil, subprocess, argparse, textwrap
+import copy
+from concurrent.futures import ThreadPoolExecutor
 from Bio import SeqIO, Phylo
 from Bio import AlignIO
 from Bio.Align import MultipleSeqAlignment
@@ -12,15 +14,21 @@ from Bio.motifs import Motif
 import tempfile
 import time
 import joblib
-import math
+import hashlib
 from ete4 import Tree
 
 NUCLEOTIDE_CONSENSUS_ALPHABET = "ACGTURYSWKMBDHVN"
 PROTEIN_CONSENSUS_ALPHABET = "ACDEFGHIKLMNPQRSTVWYBXZJUO"
+_RESUME_EXISTING = False
+_RESUME_CHECKSUMS = {}
+
+
+class PipelignError(RuntimeError):
+    """Raised when the pipeline cannot safely continue."""
+
 
 EXTERNAL_TOOL_GROUPS = {
     "common": [("mafft",), ("hmmbuild",), ("hmmpress",), ("iqtree", "iqtree2")],
-    "gnu_parallel": [("parallel",)],
     "dna_cluster": [("cd-hit-est",)],
     "aa_cluster": [("cd-hit",)],
     "dna_search": [("makeblastdb",), ("blastn",), ("nhmmscan",)],
@@ -32,7 +40,6 @@ EXTERNAL_TOOL_DETAILS = {
     ("hmmbuild",): ("hmmer", "building cluster HMMs", "stages 1-5"),
     ("hmmpress",): ("hmmer", "indexing the HMM database", "stages 1-5"),
     ("iqtree", "iqtree2"): ("iqtree", "cluster-representative tree inference", "stages 1-5"),
-    ("parallel",): ("parallel", "GNU parallel execution", "when -r G"),
     ("cd-hit-est",): ("cd-hit", "DNA/RNA sequence clustering", "stages 1-5 for dna/rna"),
     ("cd-hit",): ("cd-hit", "protein sequence clustering", "stages 1-5 for aa"),
     ("makeblastdb",): ("blast", "BLAST database construction", "stages 3-5"),
@@ -70,9 +77,6 @@ def required_external_tools(alphabet="dna", run="G", stage=5):
     tools = list(EXTERNAL_TOOL_GROUPS["common"])
     tools.extend(EXTERNAL_TOOL_GROUPS["aa_cluster" if alphabet == "aa" else "dna_cluster"])
 
-    if run == "G":
-        tools.extend(EXTERNAL_TOOL_GROUPS["gnu_parallel"])
-
     if stage in (3, 4, 5):
         tools.extend(EXTERNAL_TOOL_GROUPS["aa_search" if alphabet == "aa" else "dna_search"])
 
@@ -99,7 +103,169 @@ def check_external_dependencies(alphabet="dna", run="G", stage=5):
         details = external_tool_details(names)
         msg += "  - {display} ({purpose}; install package: {package})\n".format(**details)
     msg += "Install the missing tools with conda/micromamba/pixi from bioconda/conda-forge, then rerun pipelign.\n"
-    sys.exit(msg)
+    raise PipelignError(msg)
+
+
+def _parallel_worker_plan(task_count, thread_count):
+    if task_count < 1:
+        raise ValueError("task_count must be positive")
+    if thread_count < 1:
+        raise ValueError("thread_count must be positive")
+
+    jobs = min(task_count, thread_count)
+    return jobs, max(1, thread_count // jobs)
+
+
+def _records_by_unique_id(records, source):
+    records_by_id = {}
+    for record in records:
+        if not record.id:
+            raise ValueError("empty FASTA identifier in <%s>" % source)
+        if record.id in records_by_id:
+            raise ValueError("duplicate FASTA identifier %r in <%s>" % (record.id, source))
+        records_by_id[record.id] = record
+    return records_by_id
+
+
+def _fields(line, minimum, source, line_number):
+    fields = line.split()
+    if len(fields) < minimum:
+        raise ValueError(
+            "malformed %s output at line %d: expected at least %d fields"
+            % (source, line_number, minimum)
+        )
+    return fields
+
+
+def _cluster_number_from_name(name, source):
+    parts = name.split(".")
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise ValueError("could not parse cluster number from %r in %s output" % (name, source))
+    return parts[1]
+
+
+def _validate_text_artifact(path, label):
+    if not os.path.isfile(path):
+        raise RuntimeError("%s did not produce <%s>" % (label, path))
+    if os.path.getsize(path) == 0:
+        raise RuntimeError("%s did not produce a nonempty <%s>" % (label, path))
+
+
+def _validate_hmm_artifact(path, label):
+    _validate_text_artifact(path, label)
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        first_line = handle.readline().strip()
+    if not first_line.startswith("HMMER"):
+        raise RuntimeError("%s produced an invalid HMM file <%s>" % (label, path))
+
+
+def _validate_fasta_artifact(
+    path,
+    label,
+    alignment=False,
+    expected_ids=None,
+    expected_ungapped=None,
+):
+    _validate_text_artifact(path, label)
+    records = list(SeqIO.parse(path, "fasta"))
+    if not records:
+        raise RuntimeError("%s produced an unreadable FASTA file <%s>" % (label, path))
+    records_by_id = _records_by_unique_id(records, path)
+    if expected_ids is not None and set(records_by_id) != set(expected_ids):
+        raise RuntimeError(
+            "%s output identifiers do not match its input identifiers" % label
+        )
+    if expected_ungapped is not None:
+        observed = {
+            record.id: str(record.seq).replace("-", "").replace(".", "").upper()
+            for record in records
+        }
+        if observed != expected_ungapped:
+            raise RuntimeError(
+                "%s output does not preserve its input residues" % label
+            )
+    if alignment and len({len(record.seq) for record in records}) != 1:
+        raise RuntimeError("%s produced sequences with inconsistent aligned lengths" % label)
+    return records
+
+
+def _record_sequences(records):
+    return {
+        record.id: str(record.seq).replace("-", "").replace(".", "").upper()
+        for record in records
+    }
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def configure_resume(enabled, checksums=None):
+    """Enable reuse of already validated external-tool artifacts."""
+
+    global _RESUME_EXISTING, _RESUME_CHECKSUMS
+    _RESUME_EXISTING = bool(enabled)
+    _RESUME_CHECKSUMS = dict(checksums or {})
+
+
+def _checksum_matches(path):
+    if not _RESUME_EXISTING or not os.path.isfile(path):
+        return False
+    expected = _RESUME_CHECKSUMS.get(os.path.normpath(path))
+    return expected is not None and _sha256(path) == expected
+
+
+def _reusable_file(path):
+    return _checksum_matches(path) and os.path.getsize(path) > 0
+
+
+def _reusable_fasta(
+    path,
+    alignment=False,
+    expected_ids=None,
+    expected_ungapped=None,
+):
+    if not _RESUME_EXISTING:
+        return False
+    if not _checksum_matches(path):
+        return False
+    try:
+        _validate_fasta_artifact(
+            path,
+            "resume",
+            alignment=alignment,
+            expected_ids=expected_ids,
+            expected_ungapped=expected_ungapped,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def _copy_fasta(source, destination, expected_ids=None):
+    source_records = _validate_fasta_artifact(source, "copy input")
+    shutil.copyfile(source, destination)
+    _validate_fasta_artifact(
+        destination,
+        "copy",
+        alignment=source.endswith(".aln"),
+        expected_ids=expected_ids,
+        expected_ungapped=_record_sequences(source_records),
+    )
+
+
+def _run_threaded(tasks, worker, thread_count):
+    if not tasks:
+        return
+    jobs, threads_per_job = _parallel_worker_plan(len(tasks), thread_count)
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        futures = [executor.submit(worker, task, threads_per_job) for task in tasks]
+        for future in futures:
+            future.result()
 
 
 def _node_is_leaf(node):
@@ -253,10 +419,10 @@ def cZip(cDir,tName,zName):
     try:
         shutil.make_archive(zName,'zip',tName)
     except OSError as e:
-        sys.exit(e)
+        raise PipelignError(str(e)) from e
 
     print('\nArchive for all temporary files created in %s.zip\n' % zName)
-    sys.exit()
+    return
 
 #******************************************
 
@@ -283,7 +449,6 @@ def validateFastaType(fName,alphabet):
     '''
     # read in the sequence file and create a string of characters < 2000 length
     residues = ''
-    alpha = None
     # get around 2000 residues
     try:
         for fasta in SeqIO.parse(fName,'fasta'):
@@ -292,24 +457,24 @@ def validateFastaType(fName,alphabet):
             if len(residues) > 2000:
                 break
     except FileNotFoundError as e:
-        sys.exit(e)
+        raise PipelignError(str(e)) from e
 
     # if valid fasta file
     if residues:
-        dnaCount = residues.upper().count('A')
-        dnaCount += residues.upper().count('C')
-        dnaCount += residues.upper().count('G')
-        dnaCount += residues.upper().count('T')
+        normalized = residues.upper()
+        if alphabet in ('dna', 'rna'):
+            if alphabet == 'dna' and 'U' in normalized:
+                return False
+            if alphabet == 'rna' and 'T' in normalized:
+                return False
+            bases = 'ACGT' if alphabet == 'dna' else 'ACGU'
+            nucleotide_count = sum(normalized.count(base) for base in bases)
+            return nucleotide_count >= len(residues) * 0.5
 
-        # if
-        if dnaCount >= len(residues) * 0.5 and alphabet == 'dna':
-            return True
-        elif dnaCount < len(residues) * 0.5 and alphabet == 'aa':
-            return True
-        else:
-            return False
+        dna_count = sum(normalized.count(base) for base in 'ACGT')
+        return dna_count < len(residues) * 0.5
     else:
-        sys.exit('\nERROR: Could not parse FASTA input file. Please run pipelign with a valid FASTA file\n')
+        raise PipelignError('\nERROR: Could not parse FASTA input file. Please run pipelign with a valid FASTA file\n')
 
 #******************************************
 
@@ -323,21 +488,28 @@ def linsi(seqFile,alnFile,thread,mIterLong,log,p=None):
     else:
         lName = log + '.temp'
 
-    lh = open(lName,'a')
-    ah = open(alnFile,'w')
+    input_records = _validate_fasta_artifact(seqFile, "MAFFT input")
+    expected_ids = [record.id for record in input_records]
+    expected_ungapped = _record_sequences(input_records)
+    if _reusable_fasta(
+        alnFile,
+        alignment=True,
+        expected_ids=expected_ids,
+        expected_ungapped=expected_ungapped,
+    ):
+        return
 
     cl = ['mafft', '--localpair', '--thread', str(thread), '--maxiterate', str(mIterLong), '--preservecase', seqFile]
 
-    try:
+    with open(lName, 'a') as lh, open(alnFile, 'w') as ah:
         subprocess.check_call(cl,stdout=ah,stderr=lh)
-    except subprocess.CalledProcessError as e:
-        lh.close()
-        ah.close()
-        print(e)
-        #cZip(cDir,tName,zName)
-
-    lh.close()
-    ah.close()
+    _validate_fasta_artifact(
+        alnFile,
+        "MAFFT",
+        alignment=True,
+        expected_ids=expected_ids,
+        expected_ungapped=expected_ungapped,
+    )
 
     if not p:
         concatLogFiles('pipelign.log',lName)
@@ -355,21 +527,28 @@ def fftnsi(seqFile,alnFile,thread,mIterLong,log,p=None):
     else:
         lName = log + '.temp'
 
-    lh = open(lName,'a')
-    ah = open(alnFile,'w')
+    input_records = _validate_fasta_artifact(seqFile, "MAFFT input")
+    expected_ids = [record.id for record in input_records]
+    expected_ungapped = _record_sequences(input_records)
+    if _reusable_fasta(
+        alnFile,
+        alignment=True,
+        expected_ids=expected_ids,
+        expected_ungapped=expected_ungapped,
+    ):
+        return
 
     cl = ['mafft', '--thread', str(thread), '--maxiterate', str(mIterLong), '--preservecase', seqFile]
 
-    try:
+    with open(lName, 'a') as lh, open(alnFile, 'w') as ah:
         subprocess.check_call(cl, stdout=ah, stderr=lh)
-    except subprocess.CalledProcessError as e:
-        lh.close()
-        ah.close()
-        print(e)
-        #cZip(cDir,tName,zName)
-
-    lh.close()
-    ah.close()
+    _validate_fasta_artifact(
+        alnFile,
+        "MAFFT",
+        alignment=True,
+        expected_ids=expected_ids,
+        expected_ungapped=expected_ungapped,
+    )
 
     if not p:
         concatLogFiles('pipelign.log',lName)
@@ -416,16 +595,16 @@ def makeOutDir(dName,cFlag):
         else:
             msg = '\nERROR: Directory exists with name <{}>. Please use another name for output directory.'.format(dName)
             msg += ' Run pipelign with -c option to overwrite.\n'
-            sys.exit(msg)
+            raise PipelignError(msg)
 
     elif os.path.exists(dName):
-        sys.exit('\nERROR: File exists with name <{}>. Please use another name for output directory'.format(dName))
+        raise PipelignError('\nERROR: File exists with name <{}>. Please use another name for output directory'.format(dName))
 
     try:
         os.mkdir(dName)
         print('\nCreated output directory <{}>'.format(dName))
     except OSError as e:
-        sys.exit('\nERROR: system could not create temporary directory. Please try again\n')
+        raise PipelignError('\nERROR: system could not create temporary directory. Please try again\n') from e
 
 
 #**********************************************************************
@@ -440,7 +619,7 @@ def makeTempDir(tDir,zName):
             tempDir = tempfile.TemporaryDirectory() # create temporary directory to hold intermediary files
             tDirName = tempDir.name
         except OSError as e:
-            sys.exit('\nError: system could not create temporary directory. Please try again')
+            raise PipelignError('\nError: system could not create temporary directory. Please try again') from e
 
     else: # user provided path using -d
         if os.path.exists(tDir):
@@ -449,9 +628,9 @@ def makeTempDir(tDir,zName):
             try:
                 os.mkdir(tempDir)
             except OSError as e:
-                sys.exit('\nError: system could not create temporary directory. Please try again')
+                raise PipelignError('\nError: system could not create temporary directory. Please try again') from e
         else:
-            sys.exit('\nError: Path for temporary directory does not exists. Please run again with correct path.')
+            raise PipelignError('\nError: Path for temporary directory does not exists. Please run again with correct path.')
 
     return tempDir, tDirName
 
@@ -466,7 +645,47 @@ def copyFile(sName,dName):
     try:
         shutil.copyfile(sName,dName)
     except OSError as e:
-        sys.exit(e)
+        raise PipelignError(str(e)) from e
+
+
+def publishAlignment(source, destination):
+    """Atomically validate and publish a final alignment."""
+
+    source_records = _validate_fasta_artifact(source, "final alignment", alignment=True)
+    destination = os.path.abspath(destination)
+    parent = os.path.dirname(destination)
+    if not os.path.isdir(parent):
+        raise OSError("output directory does not exist: %s" % parent)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".%s-" % os.path.basename(destination),
+        suffix=".tmp",
+        dir=parent,
+    )
+    os.close(descriptor)
+    try:
+        shutil.copyfile(source, temporary)
+        _validate_fasta_artifact(
+            temporary,
+            "final alignment publication",
+            alignment=True,
+            expected_ids=[record.id for record in source_records],
+            expected_ungapped=_record_sequences(source_records),
+        )
+        with open(temporary, "rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        try:
+            directory_fd = os.open(parent, os.O_RDONLY)
+        except OSError:
+            pass
+        else:
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 
 #************************************************************************
@@ -481,7 +700,8 @@ def deAlign(iFile, dFile):
     # Reading sequence file in fasta format
     seqs = list(SeqIO.parse(iFile,'fasta'))
 
-    if len(seqs) > 1: # at least one sequence present | file is in FASTA format
+    if len(seqs) >= 1: # at least one sequence present | file is in FASTA format
+        _records_by_unique_id(seqs, iFile)
 
         st = ''
 
@@ -500,7 +720,7 @@ def deAlign(iFile, dFile):
         msg = '\n\nError: Could not read the input sequence file.'
         msg += '\n       Make sure the file is in FASTA format'
         msg += '\n       and at least one sequnce present in file\n'
-        sys.exit(msg)
+        raise PipelignError(msg)
 
 #*************************************************************************
 
@@ -592,10 +812,11 @@ def separateLongAmbigs(alphabet,ambigPer):
     if len(gs) > 0:
         SeqIO.write(gs,'long.good.fas','fasta')
     else:
-        print('\nAll long sequences have ambiguous characters more than allowed proportion %s' % ambigPer)
-        print('\nPlease check whether correct alphabet (e.g. dna) was selected')
-        print('\n\nPipelign is exiting\n')
-        #cZip(cDir,tFileName,zName)
+        msg = '\nAll long sequences have ambiguous characters more than allowed proportion %s' % ambigPer
+        msg += '\nPlease check whether the correct alphabet (e.g. dna) was selected'
+        msg += '\n\nPipelign is exiting\n'
+        handle.close()
+        raise PipelignError(msg)
 
     if len(bs) > 0:
         SeqIO.write(bs,'long.bad.fas','fasta')
@@ -612,6 +833,29 @@ def runCDHIT(longName,alphabet,per,thread):
     '''
       CD-HIT is used to group similar sequences together in clusters for alignment
     '''
+
+    if _reusable_file('grp') and _reusable_file('grp.clstr'):
+        try:
+            input_ids = set(
+                _records_by_unique_id(
+                    list(SeqIO.parse(longName, 'fasta')), longName
+                )
+            )
+            clustered_ids = set()
+            with open('grp.clstr') as cluster_handle:
+                for line_number, line in enumerate(cluster_handle, 1):
+                    if 'Cluster' in line:
+                        continue
+                    fields = _fields(line, 3, "CD-HIT", line_number)
+                    sequence_id = fields[2].replace('>', '').replace('...', '')
+                    if sequence_id in clustered_ids:
+                        raise ValueError("duplicate CD-HIT assignment for %r" % sequence_id)
+                    clustered_ids.add(sequence_id)
+            if clustered_ids != input_ids:
+                raise ValueError("CD-HIT output does not cover every input sequence")
+            return
+        except (OSError, RuntimeError, ValueError):
+            pass
 
     # count number of sequences in long sequence file
     seqCount = 0
@@ -631,10 +875,6 @@ def runCDHIT(longName,alphabet,per,thread):
         return
     '''
     msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
-
-    # open log file
-    lh = open('cdhit.log','a')
-
 
     # argument string for CD-HIT
     if alphabet == 'dna' or alphabet == 'rna':
@@ -669,13 +909,10 @@ def runCDHIT(longName,alphabet,per,thread):
 
     print(msg)
 
-    try:
+    with open('cdhit.log', 'a') as lh:
         subprocess.check_call(cl, stdout=lh, stderr=lh)
-    except subprocess.CalledProcessError as e:
-        print(e)
-        #cZip(cDir,tName,zName)
-
-    lh.close() # close log file
+    _validate_fasta_artifact('grp', "CD-HIT")
+    _validate_text_artifact('grp.clstr', "CD-HIT")
 
     msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
     msg += ' CD-HIT finished. Files created: <grp> and <grp.clstr>\n'
@@ -693,7 +930,7 @@ def makeClusters(longName,cName):
     if not os.path.exists(cName) or os.stat(cName).st_size == 0:
         msg = '\nError: the file <%s>  could not be found in the given path' % cName
         msg += '\n\nPipelign is exiting\n'
-        sys.exit(msg)
+        raise PipelignError(msg)
 
     # read in the long sequence file
     seqs = list(SeqIO.parse(longName,'fasta'))
@@ -717,21 +954,19 @@ def makeClusters(longName,cName):
     start = 0 # flag for the beginning of first cluster list
 
     cSeq = [] # hold sequences of a cluster
+    assigned_ids = set()
 
     cls = 0 # count clusters
 
     st = '' # clusterList string
 
-    ids = [] # IDs for the full sequences
-
-    for seq in seqs:
-        ids.append(seq.id)
+    seqs_by_id = _records_by_unique_id(seqs, longName)
 
     # read cluster file and make separate cluster files
-    if 'Cluster' not in lines[0]:
+    if not lines or 'Cluster' not in lines[0]:
         msg = '\n\nError: <%s> does not contain any cluster' % cName
         msg += '\nPlease try running the program again\n'
-        sys.exit(msg)
+        raise PipelignError(msg)
 
     for i in range(1, len(lines)):
         if 'Cluster' in lines[i]: # start of a new cluster list
@@ -743,15 +978,30 @@ def makeClusters(longName,cName):
             cSeq = []
 
         else: # continue with the existing cluster
-            seqID = lines[i].split()[2].replace('>','').replace('...','')
+            fields = _fields(lines[i], 3, "CD-HIT", i + 1)
+            seqID = fields[2].replace('>','').replace('...','')
+            if seqID in assigned_ids:
+                raise ValueError("duplicate CD-HIT assignment for %r" % seqID)
+            assigned_ids.add(seqID)
             st += seqID + '\t' + str(cls) + '\n' # updating clusterList file content
-            sInd = ids.index(seqID)
-            cSeq.append(seqs[sInd])
+            try:
+                cSeq.append(seqs_by_id[seqID])
+            except KeyError as exc:
+                raise ValueError(
+                    "CD-HIT output references unknown sequence identifier %r" % seqID
+                ) from exc
 
     gName = 'long.' + str(cls) + '.fas'
     cls = cls + 1
     if len(cSeq) > 0:
         SeqIO.write(cSeq,gName,'fasta')
+
+    if assigned_ids != set(seqs_by_id):
+        missing = sorted(set(seqs_by_id) - assigned_ids)
+        raise ValueError(
+            "CD-HIT output does not assign every input sequence; missing: %s"
+            % ", ".join(missing)
+        )
 
     fh = open('long.ClusterList.txt','w')
     fh.write(st)
@@ -765,7 +1015,7 @@ def makeClusters(longName,cName):
         msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
         msg += ' Could not create cluster files.'
         msg += '\nPipelign is exiting\n'
-        sys.exit(msg)
+        raise PipelignError(msg)
 
     return cls #, clsSize
 
@@ -780,30 +1030,32 @@ def addClusterNumberToReps(repName,lstFile,outFile):
     # read in the <long.ClusterList.txt> file
     #cList = [line.strip() for line in open(lstFile,'r')]
 
-    cID = [] # sequence ids
-    cNum = [] # cluster numbers
+    clusters_by_id = {}
+    cluster_sizes = {}
 
     with open(lstFile,'r') as f:
-        for line in f:
-            words = line.split()
-            cID.append(words[0])
-            cNum.append(words[1])
+        for line_number, line in enumerate(f, 1):
+            words = _fields(line, 2, lstFile, line_number)
+            if words[0] in clusters_by_id:
+                raise ValueError("duplicate sequence identifier %r in <%s>" % (words[0], lstFile))
+            clusters_by_id[words[0]] = words[1]
+            cluster_sizes[words[1]] = cluster_sizes.get(words[1], 0) + 1
 
     # read in the cluster reps file
     seqs = list(SeqIO.parse(repName,'fasta'))
+    _records_by_unique_id(seqs, repName)
 
     for seq in seqs:
-        if seq.id in cID:
-            ind = cID.index(seq.id)
-
-            seq.id = seq.id + '_' + str(cNum.count(cNum[ind])) + '_' + cNum[ind]
+        if seq.id in clusters_by_id:
+            cluster_number = clusters_by_id[seq.id]
+            seq.id = seq.id + '_' + str(cluster_sizes[cluster_number]) + '_' + cluster_number
             seq.name = seq.id
             seq.description = seq.id
         else:
             msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
             msg += ' Error: %s was not found in <long.ClusterList.txt>.' % seq.id
             msg += '\nPipelign is exiting\n'
-            sys.exit(msg)
+            raise PipelignError(msg)
 
     # write reps file
     SeqIO.write(seqs,outFile,'fasta')
@@ -814,31 +1066,38 @@ def makeIQTree(alnFile,thread,alpha):
       - Constructs phylogenetic tree using IQ-TREE
     '''
 
-    lh = open('tree.log','a')
-
     #print('\nCreating IQ-TREE from %s' % alnFile)
+    _validate_fasta_artifact(alnFile, "IQ-TREE input", alignment=True)
+    tree_path = alnFile + '.treefile'
+    if _reusable_file(tree_path):
+        try:
+            Phylo.read(tree_path, 'newick')
+            return
+        except Exception:
+            pass
 
     iqtree = _first_available_executable("iqtree", "iqtree2")
     if iqtree is None:
-        sys.exit("\nERROR: Missing required external executable: iqtree or iqtree2\n")
+        raise PipelignError("\nERROR: Missing required external executable: iqtree or iqtree2\n")
 
     if alpha == 'dna' or alpha == 'rna':
         cl = [iqtree, '-s', alnFile, '-m', 'GTR+R4', '-nt', str(thread)]
     elif alpha == 'aa':
         cl = [iqtree, '-s', alnFile, '-m', 'WAG', '-nt', str(thread)]
 
-    try:
+    with open('tree.log', 'a') as lh:
         subprocess.check_call(cl,stdout=lh,stderr=lh)
-    except subprocess.CalledProcessError as e:
-        print(e)
-        lh.close()
-        #cZip(cDir,tName,zName)
-
-    lh.close()
+    _validate_text_artifact(tree_path, "IQ-TREE")
+    try:
+        Phylo.read(tree_path, 'newick')
+    except Exception as exc:
+        raise RuntimeError("IQ-TREE produced invalid Newick output <%s>" % tree_path) from exc
 
     concatLogFiles('pipelign.log','tree.log')
     os.remove('tree.log')
-    os.remove('clsReps.aln.ckp.gz')
+    checkpoint = alnFile + '.ckp.gz'
+    if os.path.exists(checkpoint):
+        os.remove(checkpoint)
 
 #***********************************************************************
 def makeMidPointRootTree(treeFile):
@@ -854,6 +1113,7 @@ def makeMidPointRootTree(treeFile):
 
     # Write midpoint root tree
     Phylo.write(tree,'clsReps.aln.midpoint.treefile','newick')
+    _validate_text_artifact('clsReps.aln.midpoint.treefile', "midpoint rooting")
 
 #***********************************************************************
 
@@ -875,60 +1135,24 @@ def drawAsciiTree(treeFile):
 #***********************************************************************
 def alnLongSequenceClustersGNUParallel(nClusters,thread,mIterL):
     '''
-        aligns long sequence cluster files using GNU parallel
+        Align long sequence cluster files using Python-managed subprocesses.
+
+        The legacy function name is retained for API compatibility.
     '''
+    tasks = _long_alignment_tasks(nClusters)
+    if not tasks:
+        return
 
-    log = 'align.log'
-    fh = open(log,'a')
+    def worker(task, threads_per_job):
+        method, source, destination, record_ids, cluster = task
+        if method == "copy":
+            _copy_fasta(source, destination, expected_ids=record_ids)
+        elif method == "linsi":
+            linsi(source, destination, threads_per_job, mIterL, "align.log", cluster)
+        else:
+            fftnsi(source, destination, threads_per_job, mIterL, "align.log", cluster)
 
-    numClusters = nClusters - 1 # for bash run
-
-    #msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
-    #msg += ' Started aligning long sequence clusters\n'
-    #print(msg)
-
-    pStr = '#!/bin/bash\n\n'
-    pStr += 'my_func(){\n\n'
-    pStr += '\tinF="long.$1.fas"\n\n'
-    pStr += '\tif [ -a $inF ]\n'
-    pStr += '\tthen\n'
-    pStr += '\t\tlen=$(grep -c ">" $inF)\n'
-    pStr += '\tfi\n\n'
-
-    pStr += '\tif [ "$len" -eq "1" ]\n'
-    pStr += '\tthen\n'
-    pStr += '\t\tcat $inF > long.$1.aln\n'
-    pStr += '\t\techo "cluster $1 has only one sequence. <long.$1.aln> written"\n\n'
-
-    pStr += '\telif [ "$len" -le "100" ]\n'
-    pStr += '\tthen\n'
-    pStr += '\t\tmafft --localpair --thread $2 --maxiterate $3 --preservecase $inF > long.$1.aln\n'
-    pStr += '\t\techo "Alignment file <long.$1.aln> created with $len sequences"\n'
-    pStr += '\telse\n'
-    pStr += '\t\tmafft --thread $2 --maxiterate $3 --preservecase $inF > long.$1.aln\n'
-    pStr += '\t\techo "Alignment file <long.$1.aln> created with $len sequences"\n'
-    pStr += '\tfi\n\n'
-    pStr += '}\n\n'
-
-    pStr += 'export -f my_func\n\n'
-    pStr += 'parallel -j %s my_func ::: $(seq 0 1 %d) ::: %s ::: %s' % (thread,numClusters,thread,mIterL)
-
-    il = open('longAlign.sh','w')
-    il.write(pStr)
-    il.close()
-
-    # assign executable permission to the file
-    st = os.stat('longAlign.sh')
-    os.chmod('longAlign.sh', st.st_mode | stat.S_IEXEC)
-
-    # subprocess call to run mafft in parallel
-    script = ['./longAlign.sh']
-
-    try:
-      subprocess.check_call(script,stderr=fh)
-    except OSError as e:
-      print(e)
-      #cZip(cDir,tName,zName)
+    _run_threaded(tasks, worker, thread)
 
 #***********************************************************************
 def alnLongSequenceClustersJoblibParallel(nClusters,thread,mIterL):
@@ -943,32 +1167,49 @@ def alnLongSequenceClustersJoblibParallel(nClusters,thread,mIterL):
   msg += ' Started aligning long sequence clusters\n'
   print(msg)
 
-  # Fork the worker processes to perform computation concurrently
-  # Create parameter map
-  aln = lambda i : ('long.' + str(i) + '.fas', 'long.' + str(i) + '.aln')
+  tasks = _long_alignment_tasks(nClusters)
+  if not tasks:
+    return
+  jobs, threads_per_job = _parallel_worker_plan(len(tasks), thread)
 
-  to_run_tuples = list(map(aln, range(nClusters)))
-  to_run_linsi = list(filter(lambda x : 1 < len(list(SeqIO.parse(str(x[0]),'fasta'))) < 101, to_run_tuples))
-  to_run_fftnsi = list(filter(lambda x : len(list(SeqIO.parse(str(x[0]),'fasta'))) > 100, to_run_tuples))
-  to_copy = list(filter(lambda x : len(list(SeqIO.parse(str(x[0]),'fasta'))) <= 1, to_run_tuples))
+  def run_task(task):
+    method, source, destination, record_ids, cluster = task
+    if method == "copy":
+      _copy_fasta(source, destination, expected_ids=record_ids)
+    elif method == "linsi":
+      linsi(source, destination, threads_per_job, mIterL, log, cluster)
+    else:
+      fftnsi(source, destination, threads_per_job, mIterL, log, cluster)
 
-  if len(to_run_linsi):
-    num_parallel_jobs = int(nClusters/thread) if nClusters > thread else thread
-    num_threads_per_job = int(thread/nClusters) if thread > nClusters else 1
-    joblib.Parallel(n_jobs=num_parallel_jobs)(joblib.delayed(linsi)(x[0],x[1],num_threads_per_job,mIterL,log,x[0].split('.')[1]) for x in to_run_linsi)
-
-  if len(to_run_fftnsi):
-    num_parallel_jobs = int(nClusters/thread) if nClusters > thread else thread
-    num_threads_per_job = int(thread/nClusters) if thread > nClusters else 1
-    joblib.Parallel(n_jobs=num_parallel_jobs)(joblib.delayed(fftnsi)(x[0],x[1],num_threads_per_job,mIterL,log,x[0].split('.')[1])  for x in to_run_fftnsi)
-
-  if len(to_copy):
-    num_parallel_jobs = math.ceil(len(to_copy)/thread) if nClusters < thread else thread
-    joblib.Parallel(n_jobs=num_parallel_jobs)(joblib.delayed(shutil.copyfile)(x[0],x[1]) for x in to_copy)
+  joblib.Parallel(n_jobs=jobs, prefer="threads")(
+    joblib.delayed(run_task)(task) for task in tasks
+  )
 
   msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
   msg += ' Finished aligning long sequence clusters. Created files: <long.x.aln>\n'
   print(msg)
+
+
+#***********************************************************************
+
+def _long_alignment_tasks(nClusters):
+  tasks = []
+  for cluster in range(nClusters):
+    source = 'long.' + str(cluster) + '.fas'
+    destination = 'long.' + str(cluster) + '.aln'
+    records = _validate_fasta_artifact(source, "cluster preparation")
+    count = len(records)
+    record_ids = [record.id for record in records]
+    if _reusable_fasta(
+      destination,
+      alignment=True,
+      expected_ids=record_ids,
+      expected_ungapped=_record_sequences(records),
+    ):
+      continue
+    method = "copy" if count == 1 else ("linsi" if count <= 100 else "fftnsi")
+    tasks.append((method, source, destination, record_ids, str(cluster)))
+  return tasks
 
 
 #***********************************************************************
@@ -985,25 +1226,34 @@ def makeHMMdbParallel(nClusters,thread,alphabet,log):
     hmm = lambda i : ('long.' + str(i) + '.aln', 'long.' + str(i) + '.hmm')
 
     to_run_tuples = list(map(hmm, range(nClusters)))
+    if _RESUME_EXISTING:
+        to_run_tuples = [
+            task for task in to_run_tuples
+            if not _reusable_file(task[1])
+        ]
 
     if len(to_run_tuples):
         msg = '\n[' + time.strftime('%d %b %H:%M:%S') + ']'
         msg += ' Started building HMMs from long cluster alignments\n'
         print(msg)
 
-        num_parallel_jobs = int(nClusters/thread) if nClusters > thread else thread
-        num_threads_per_job = int(thread/nClusters) if thread > nClusters else 1
-        joblib.Parallel(n_jobs=num_parallel_jobs)(joblib.delayed(buildHMM)(x[0],x[1],num_threads_per_job,alphabet,log,x[0].split('.')[1])  for x in to_run_tuples)
+        num_parallel_jobs, num_threads_per_job = _parallel_worker_plan(len(to_run_tuples), thread)
+        joblib.Parallel(n_jobs=num_parallel_jobs, prefer="threads")(
+            joblib.delayed(buildHMM)(
+                x[0], x[1], num_threads_per_job, alphabet, log, x[0].split('.')[1]
+            )
+            for x in to_run_tuples
+        )
 
-        msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
-        msg += ' Building HMM database\n'
-        print(msg)
+    msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
+    msg += ' Building HMM database\n'
+    print(msg)
 
-        buildHMMdb(nClusters)
+    buildHMMdb(nClusters)
 
-        msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
-        msg += ' HMM database created\n'
-        print(msg)
+    msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
+    msg += ' HMM database created\n'
+    print(msg)
 
 #***********************************************************************
 def buildHMM(aName,hName,thread,alphabet,log,p=None):
@@ -1016,15 +1266,17 @@ def buildHMM(aName,hName,thread,alphabet,log,p=None):
     else:
         lName = log + '.temp'
 
-    lh = open(lName,'a')
+    _validate_fasta_artifact(aName, "HMMER input", alignment=True)
+    if _reusable_file(hName):
+        try:
+            _validate_hmm_artifact(hName, "resume")
+            return
+        except RuntimeError:
+            pass
 
     gName = aName + '.temp'
     # create a temporary file to hold the alignment to build HMM
-    try:
-        shutil.copy(aName,gName)
-    except OSError as e:
-        print(e)
-        #cZip(cDir,tName,zName)
+    shutil.copyfile(aName, gName)
 
     #*****testing for failure of hmmbuild
     # hmmbuild fails when single sequence is present
@@ -1037,7 +1289,7 @@ def buildHMM(aName,hName,thread,alphabet,log,p=None):
 
     # for a single sequence cluster, add itself
     if len(aseqs) == 1:
-        aseqs.append(aseqs[0])
+        aseqs.append(copy.deepcopy(aseqs[0]))
         aseqs[1].id = aseqs[0].id + '_1'
         aseqs[1].name = aseqs[1].id
         aseqs[1].description = aseqs[1].id
@@ -1055,12 +1307,7 @@ def buildHMM(aName,hName,thread,alphabet,log,p=None):
                 seq.seq = seq.seq + '-'
 
             # Update 'temp.aln' file
-            try:
-                os.remove(gName)
-            except OSError as e:
-                print(e)
-                #cZip(cDir,tName, zName)
-
+            os.remove(gName)
             SeqIO.write(aseqs,gName,'fasta')
 
 
@@ -1076,21 +1323,12 @@ def buildHMM(aName,hName,thread,alphabet,log,p=None):
 
     # run hmmbuild command
     try:
-        subprocess.check_call(cl,stdout=lh,stderr=lh)
-    except subprocess.CalledProcessError as e:
-        #sys.exit(e)
-        print(e)
-        #cZip(cDir,tName,zName)
-    #print('\t<%s> created' % hName)
-
-    # remove the temporary alignment file
-    try:
-        os.remove(gName)
-    except OSError as e:
-        print(e)
-        #cZip(cDir,tName,zName)
-
-    lh.close()
+        with open(lName, 'a') as lh:
+            subprocess.check_call(cl,stdout=lh,stderr=lh)
+        _validate_hmm_artifact(hName, "hmmbuild")
+    finally:
+        if os.path.exists(gName):
+            os.remove(gName)
 
     if not p:
         concatLogFiles('pipelign.log',lName)
@@ -1104,6 +1342,10 @@ def buildHMMdb(nClusters):
     '''
 
     dbName = 'pipelign.hmm'
+    if _RESUME_EXISTING:
+        paths = [dbName] + [dbName + suffix for suffix in ('.h3f', '.h3i', '.h3m', '.h3p')]
+        if all(_reusable_file(path) for path in paths):
+            return
 
     # write all HMMs in one file
     with open(dbName,'w') as fh:
@@ -1115,17 +1357,12 @@ def buildHMMdb(nClusters):
     # create HMM database
     cl = ['hmmpress', '-f', dbName]
 
-    lh = open('buildhmm.log','a')
-
     # run command
-    try:
+    with open('buildhmm.log', 'a') as lh:
         subprocess.check_call(cl, stdout=lh, stderr=lh)
-    except subprocess.CalledProcessError as e:
-        #sys.exit(e)
-        print(e)
-        #cZip(cDir,tName)
-
-    lh.close()
+    _validate_hmm_artifact(dbName, "HMM database build")
+    for suffix in ('.h3f', '.h3i', '.h3m', '.h3p'):
+        _validate_text_artifact(dbName + suffix, "hmmpress")
 
     concatLogFiles('pipelign.log','buildhmm.log')
     os.remove('buildhmm.log')
@@ -1157,7 +1394,7 @@ def longSeqClusters(tempDirPath,cDir,tDirName,tFileName):
     print(msg)
 
     print('\nThank you for using Pipelign.\n')
-    sys.exit(0)
+    return
 
 #***********************************************************************
 
@@ -1184,92 +1421,35 @@ def changeLeafNamesToClusterNames(tree,tp):
 
 def mergeCherries_gnu_parallel(nCherries,cStr,iNodes,fPre,thread,mIterL,log):
     '''
-     merge pair of alignments in parallel using GNU's parallel tool
+     Merge pairs concurrently using Python-managed subprocesses.
+
+     The legacy function name is retained for API compatibility.
     '''
     msg = '\n[' + time.strftime('%d %b %H:%M:%S') + ']'
     msg += ' Merging pairs of clusters\n'
     print(msg)
 
-    pStr = '#!/bin/bash\n\n'
-    pStr += 'my_func(){\n\n'
+    cherries = cStr.split()
+    if len(cherries) != nCherries * 2 or len(iNodes) != nCherries:
+        raise ValueError("merge task metadata is inconsistent")
+    tasks = [
+        (cherries[index * 2], cherries[index * 2 + 1], iNodes[index], index)
+        for index in range(nCherries)
+    ]
 
-    pStr += '\tind1=$(($1*2-1))\n'
-    pStr += '\tind2=$(($1*2))\n\n'
+    def worker(task, threads_per_job):
+        first, second, output, index = task
+        mergePair(
+            first + '.aln',
+            second + '.aln',
+            output + '.aln',
+            threads_per_job,
+            mIterL,
+            log,
+            "%s.%d" % (fPre, index),
+        )
 
-    pStr += '\taln1=$(echo $4 | awk -v var="$ind1" \'{print $var}\')\n'
-    pStr += '\taln2=$(echo $4 | awk -v var="$ind2" \'{print $var}\')\n'
-    pStr += '\toName=$(echo $5 | awk -v var="$1" \'{print $var}\')\n\n'
-    pStr += '\techo "Merging $aln1.aln and $aln2.aln into $oName.aln"\n\n'
-
-    pStr += '\tl1=$(grep -c ">" $aln1.aln)\n'
-    pStr += '\tl2=$(grep -c ">" $aln2.aln)\n\n'
-
-    pStr += '\tif [ $l1 -eq "1" ] && [ $l2 -eq "1" ] \n'
-    pStr += '\tthen\n'
-    pStr += '\t\tcat $aln1.aln $aln2.aln > temp.$6.$1.fas\n'
-    pStr += '\t\tmafft --localpair --preservecase --thread $2 --maxiterate $3 temp.$6.$1.fas > $oName.aln\n'
-    pStr += '\telif [ $l1 -eq "1" ] \n'
-    pStr += '\tthen\n'
-    pStr += '\t\tmafft --preservecase --thread $2 --maxiterate $3 --addfragments $aln1.aln $aln2.aln > $oName.aln\n'
-    pStr += '\telif [ $l2 -eq "1" ] \n'
-    pStr += '\tthen\n'
-    pStr += '\t\tmafft --preservecase --thread $2 --maxiterate $3 --addfragments $aln2.aln $aln1.aln > $oName.aln\n'
-    pStr += '\telse\n'
-    pStr += '\t\tcat $aln1.aln $aln2.aln > input.$6.$1.fas\n'
-    pStr += '\t\tstr1=""\n'
-    pStr += '\t\tcount=1\n'
-    pStr += '\t\tgap=" "\n\n'
-
-    pStr += '\t\tfor i in $(seq 1 1 $l1)\n'
-    pStr += '\t\tdo\n'
-    pStr += '\t\t\tstr1=$str1$count$gap\n'
-    pStr += '\t\t\tcount=$(($count+1))\n'
-    pStr += '\t\tdone\n\n'
-
-    pStr += '\t\techo $str1 > msaTable.$6.$1\n'
-    #pStr += '\t\techo "" >> msaTable.$6.$1\n\n'
-
-    pStr += '\t\tstr2=""\n'
-    pStr += '\t\tfor i in $(seq 1 1 $l2)\n'
-    pStr += '\t\tdo\n'
-    pStr += '\t\t\tstr2=$str2$count$gap\n'
-    pStr += '\t\t\tcount=$(($count+1))\n'
-    pStr += '\t\tdone\n\n'
-
-    pStr += '\t\techo $str2 >> msaTable.$6.$1\n'
-
-    pStr += '\t\tmafft --preservecase --thread $2 --maxiterate $3 --merge msaTable.$6.$1 input.$6.$1.fas > $oName.aln\n\n'
-
-    pStr += '\tfi\n\n'
-
-    pStr += '}\n\n'
-
-    pStr += 'export -f my_func\n\n'
-
-    pStr += 'parallel -j %s my_func ::: $(seq 1 1 %d)' % (thread,nCherries)
-    pStr += ' ::: %s ::: %s ::: "%s"' % (thread,mIterL,cStr)
-    pStr += ' ::: "%s" ::: "%s"\n' % (' '.join(iNodes), fPre)
-
-    il = open('mergeParallel.sh','w')
-    il.write(pStr)
-    il.close()
-
-    # assign executable permission to the bash script
-    st = os.stat('mergeParallel.sh')
-    os.chmod('mergeParallel.sh',st.st_mode | stat.S_IEXEC)
-
-    # subprocess call to run merge in parallel
-    script = ['./mergeParallel.sh']
-
-    try:
-        fh = open('merge.log','a')
-        subprocess.check_call(script,stderr=fh)
-    except OSError as e:
-        print(e)
-        fh.close()
-        #cZip(cDir,tName,zName)
-
-    fh.close()
+    _run_threaded(tasks, worker, thread)
 
 #************************************************************************
 
@@ -1283,46 +1463,63 @@ def mergePair(aln1,aln2,alnFile,thread,mIterLong,log,p=None):
     else:
         lName = log + '.temp'
 
-    lh = open(lName,'a')
-    ah = open(alnFile,'w')
-
-    seq1 = list(SeqIO.parse(aln1,'fasta'))
-    seq2 = list(SeqIO.parse(aln2,'fasta'))
+    seq1 = _validate_fasta_artifact(aln1, "MAFFT merge input", alignment=True)
+    seq2 = _validate_fasta_artifact(aln2, "MAFFT merge input", alignment=True)
 
     lSeq1 = len(seq1)
     lSeq2 = len(seq2)
 
-    nSeq = seq1 + seq2
-    SeqIO.write(nSeq,'input','fasta')
+    suffix = '.' + str(p) if p else '.temp'
+    input_name = 'merge-input' + suffix + '.fas'
+    table_name = 'merge-table' + suffix + '.txt'
+    expected_ids = [record.id for record in seq1 + seq2]
+    expected_ungapped = _record_sequences(seq1 + seq2)
+    if _reusable_fasta(
+        alnFile,
+        alignment=True,
+        expected_ids=expected_ids,
+        expected_ungapped=expected_ungapped,
+    ):
+        return
 
-    mStr = ''
-    count = 1
-    for i in range(lSeq1):
-        mStr += str(count) + ' '
-        count += 1
-    mStr += '\n'
-    for i in range(lSeq2):
-        mStr += str(count) + ' '
-        count += 1
+    if lSeq1 == 1 and lSeq2 == 1:
+        SeqIO.write(seq1 + seq2, input_name, 'fasta')
+        cl = [
+            'mafft', '--localpair', '--thread', str(thread), '--maxiterate',
+            str(mIterLong), '--preservecase', input_name,
+        ]
+    elif lSeq1 == 1:
+        cl = [
+            'mafft', '--thread', str(thread), '--maxiterate', str(mIterLong),
+            '--preservecase', '--addfragments', aln1, aln2,
+        ]
+    elif lSeq2 == 1:
+        cl = [
+            'mafft', '--thread', str(thread), '--maxiterate', str(mIterLong),
+            '--preservecase', '--addfragments', aln2, aln1,
+        ]
+    else:
+        SeqIO.write(seq1 + seq2, input_name, 'fasta')
+        first_indices = ' '.join(str(index) for index in range(1, lSeq1 + 1))
+        second_indices = ' '.join(
+            str(index) for index in range(lSeq1 + 1, lSeq1 + lSeq2 + 1)
+        )
+        with open(table_name, 'w') as table:
+            table.write(first_indices + '\n' + second_indices)
+        cl = [
+            'mafft', '--thread', str(thread), '--maxiterate', str(mIterLong),
+            '--preservecase', '--merge', table_name, input_name,
+        ]
 
-    # write subMSAtable
-    fh = open('subMSAtable','w')
-    fh.write(mStr)
-    fh.close()
-
-
-    cl = ['mafft', '--thread', str(thread), '--maxiterate', str(mIterLong), '--preservecase', '--merge', 'subMSAtable', 'input']
-
-    try:
+    with open(lName, 'a') as lh, open(alnFile, 'w') as ah:
         subprocess.check_call(cl,stdout=ah,stderr=lh)
-    except subprocess.CalledProcessError as e:
-        lh.close()
-        ah.close()
-        print(e)
-        #cZip(cDir,tName,zName)
-
-    lh.close()
-    ah.close()
+    _validate_fasta_artifact(
+        alnFile, "MAFFT merge", alignment=True, expected_ids=expected_ids
+        , expected_ungapped=expected_ungapped
+    )
+    for temporary in (input_name, table_name):
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
     if not p:
         concatLogFiles('pipelign.log',lName)
@@ -1367,7 +1564,7 @@ def merge_gnu_parallel(repTree,tp,thread,mIterL,log):
         if not cherries:
             raise RuntimeError("no mergeable cherries found in <%s>" % repTree)
         if len(cherries) % 2 != 0:
-            sys.exit('incomplete cherries found: exiting')
+            raise PipelignError('incomplete cherries found: exiting')
         # even number of leafs in cherries list
         # get number of cherries
         nCherries = int(len(cherries) / 2)
@@ -1397,21 +1594,28 @@ def addLongSeqs(sName,aName,oName,thread,mIterL,log):
 
     lName = log + '.temp'
 
-    lh = open(lName,'a')
-    ah = open(oName,'w')
+    sequence_records = _validate_fasta_artifact(sName, "MAFFT full-sequence input")
+    alignment_records = _validate_fasta_artifact(aName, "MAFFT alignment input", alignment=True)
+    expected_ids = [record.id for record in alignment_records + sequence_records]
+    expected_ungapped = _record_sequences(alignment_records + sequence_records)
+    if _reusable_fasta(
+        oName,
+        alignment=True,
+        expected_ids=expected_ids,
+        expected_ungapped=expected_ungapped,
+    ):
+        return
 
     cl = ['mafft', '--preservecase', '--thread', str(thread), '--maxiterate', str(mIterL), '--addfull', sName, aName]
 
-    try:
+    with open(lName, 'a') as lh, open(oName, 'w') as ah:
         subprocess.check_call(cl,stdout=ah,stderr=lh)
-    except subprocess.CalledProcessError as e:
-        lh.close()
-        ah.close()
-        print(e)
-        #cZip(cDir,tName,zName)
-
-    lh.close()
-    ah.close()
+    _validate_fasta_artifact(
+        oName,
+        "MAFFT full-sequence alignment",
+        alignment=True,
+        expected_ids=expected_ids,
+    )
 
     concatLogFiles(log,lName)
     os.remove(lName)
@@ -1463,6 +1667,7 @@ def mergeConsensus(numClusters,oName,tp,mArgs,log):
     ## read in the consensus alignment
     ## get positions for gaps in each sequence
     ## add gaps to their respective positions in the cluster alignments
+    expected_ids = []
     with open(oName,'w') as fh: # create the output alignment file
         # read consensus alignment
         with open('consensus.aln') as ch:
@@ -1477,6 +1682,7 @@ def mergeConsensus(numClusters,oName,tp,mArgs,log):
                 seqs = SeqIO.parse(cHandle,'fasta')
 
                 for seq in seqs:
+                    expected_ids.append(seq.id)
                     # create a string object to write in the file
                     st = '>' + seq.id + '\n'
 
@@ -1490,6 +1696,12 @@ def mergeConsensus(numClusters,oName,tp,mArgs,log):
                     st += seq.seq[start:] + '\n'
 
                     fh.write(str(st))
+    _validate_fasta_artifact(
+        oName,
+        "consensus merge",
+        alignment=True,
+        expected_ids=expected_ids,
+    )
 
 
 #***********************************************************************
@@ -1589,8 +1801,6 @@ def runBlast(log,mArgs):
     '''
     # first create blast database of cluster reps
     bName = log + '.temp'
-    bl = open(bName,'a')
-
     cStr = 'makeblastdb -in clsReps.fas -input_type fasta -title pipelign -dbtype '
     if mArgs.alphabet in ['dna','rna']:
         cStr += 'nucl '
@@ -1603,12 +1813,15 @@ def runBlast(log,mArgs):
     msg += ' Creating BLAST database from Cluster representatives\n'
     print(msg)
 
-    try:
+    with open(bName, 'a') as bl:
         cl = cStr.split()
         subprocess.check_call(cl,stdout=bl,stderr=bl)
-    except subprocess.CalledProcessError as e:
-        print(e)
-        cZip(cDir,tName,zName)
+    database_files = [
+        name for name in os.listdir('.')
+        if name.startswith('pipelign.blastdb.')
+    ]
+    if not database_files:
+        raise RuntimeError("makeblastdb did not produce database index files")
 
     # search fragments on the database to assign clusters
     cStr = ''
@@ -1620,14 +1833,11 @@ def runBlast(log,mArgs):
     cStr += '-query frag.fas -db pipelign.blastdb -max_target_seqs 1 -outfmt 6 -evalue 0.05'
     #cStr += '-evalue 20 | sort -u -k1,2'
 
-    bo = open('frag.blast.txt','w')
-
-    try:
+    with open('frag.blast.txt', 'w') as bo, open(bName, 'a') as bl:
         cl = cStr.split()
         subprocess.check_call(cl,stdout=bo,stderr=bl)
-    except subprocess.CalledProcessError as e:
-        print(e)
-        cZip(cDir,tName,zName)
+    if not os.path.isfile('frag.blast.txt'):
+        raise RuntimeError("BLAST did not produce <frag.blast.txt>")
 
     # get uniq BLAST hits for each fragments
 
@@ -1640,18 +1850,25 @@ def runBlast(log,mArgs):
     st = '' # holds string for frag.ClusterList.txt
 
     mids = [] # holds names of the matched fragments
+    matched = set()
 
-    for line in lines:
-        words = line.split()
-        if words[0] not in mids:
-            st += words[0] + '\t' + words[1].split('_')[-1] + '\n'
+    for line_number, line in enumerate(lines, 1):
+        if not line:
+            continue
+        words = _fields(line, 2, "BLAST", line_number)
+        cluster_number = words[1].rsplit('_', 1)[-1]
+        if not cluster_number.isdigit():
+            raise ValueError(
+                "could not parse cluster number from BLAST subject %r" % words[1]
+            )
+        if words[0] not in matched:
+            st += words[0] + '\t' + cluster_number + '\n'
             mids.append(words[0])
+            matched.add(words[0])
 
     fh = open('frag.ClusterList.txt','w')
     fh.write(st)
     fh.close()
-
-    bl.close()
 
     concatLogFiles('pipelign.log',bName)
     os.remove(bName)
@@ -1665,8 +1882,6 @@ def searchHMMdb(log,thread,alpha,res):
     '''
 
     lName = log + '.temp'
-    lh = open(lName,'a')
-
     # generate the command for HMM search
     if alpha == 'dna' or alpha == 'rna':
         cStr = 'nhmmscan --cpu %d --tblout %s --noali  -E 0.05 pipelign.hmm frag.noBlast.fas' % (thread,res)
@@ -1678,14 +1893,11 @@ def searchHMMdb(log,thread,alpha,res):
     msg += ' Searching HMM database to assign clusters to remaining fragments\n'
     print(msg)
 
-    try:
+    with open(lName, 'a') as lh:
         cl = cStr.split()
         subprocess.check_call(cl,stdout=lh,stderr=lh)
-    except subprocess.CalledProcessError as e:
-        print(e)
-        #cZip(cDir,tName,zName)
-
-    lh.close()
+    if not os.path.isfile(res):
+        raise RuntimeError("HMMER did not produce <%s>" % res)
 
     concatLogFiles('pipelign.log',lName)
     os.remove(lName)
@@ -1703,10 +1915,9 @@ def createFragmentClusters(numClusters):
     # read in the fragment sequnece file
     fseqs = list(SeqIO.parse('frag.fas','fasta'))
 
-    fids = [] # holds the ids of all fragments
-
-    for f in fseqs:
-        fids.append(f.id)
+    fragments_by_id = _records_by_unique_id(fseqs, 'frag.fas')
+    fids = list(fragments_by_id)
+    fragment_index = {fragment_id: index for index, fragment_id in enumerate(fids)}
 
     # create an empty list to hold flags for fragments that are assigned clusters
     fragFlags = []
@@ -1719,25 +1930,35 @@ def createFragmentClusters(numClusters):
         clsList = [line.strip() for line in fh]
 
     ids = [] # holds IDs of the assigned fragments
+    assigned_ids = set()
     cnum= [] # holds the cluster numbers
 
-    for line in clsList:
-        words = line.split()
+    for line_number, line in enumerate(clsList, 1):
+        words = _fields(line, 2, 'frag.ClusterList.txt', line_number)
+        if words[0] in assigned_ids:
+            raise ValueError("duplicate fragment assignment for %r" % words[0])
+        try:
+            cluster_number = int(words[1])
+        except ValueError as exc:
+            raise ValueError("invalid fragment cluster number %r" % words[1]) from exc
+        if cluster_number < 0 or cluster_number >= numClusters:
+            raise ValueError("fragment cluster number %d is out of range" % cluster_number)
         ids.append(words[0])
-        cnum.append(words[1])
+        assigned_ids.add(words[0])
+        cnum.append(cluster_number)
     #print(cnum)
     for i in range(numClusters):
         tfrags = [] # temporary list of all the fragments of that cluster
 
         # get the indices with cluster 'i'
-        indices = [j for j, x in enumerate(cnum) if int(x) == i]
+        indices = [j for j, x in enumerate(cnum) if x == i]
         #print(indices)
 
         for ind in indices:
             fname = ids[ind] # get the sequence name/ID
-            if fname in fids: # if id matches to the fragment list
-                sind = fids.index(fname) # get the index in the fragment file
-                tfrags.append(fseqs[sind]) # add fragment to the cluster list
+            if fname in fragments_by_id: # if id matches to the fragment list
+                sind = fragment_index[fname] # get the index in the fragment file
+                tfrags.append(fragments_by_id[fname]) # add fragment to the cluster list
                 fragFlags[sind] = 1 # flag
 
         if len(tfrags) > 0:
@@ -1771,36 +1992,32 @@ def getHMMclusters():
 
     '''
     # open <frag.ClusterList.txt> for appending new entries
-    fh = open('frag.ClusterList.txt','a')
-
     # read in the hmm.out file
-    with open('hmm.out','r') as fh:
-        hmmOut = [line.strip() for line in fh]
+    with open('hmm.out','r') as hmm_handle:
+        hmmOut = [line.strip() for line in hmm_handle]
 
-    qids = [] # list all matched query IDs from output file
-    hids = [] # list the hmm that they matched with
+    clusters_by_query = {}
 
     # make lists of queries and target HMMs
-    for line in hmmOut:
+    for line_number, line in enumerate(hmmOut, 1):
         if not line.startswith('#'):
-            words = line.split()
+            if not line:
+                continue
+            words = _fields(line, 3, "HMMER", line_number)
             query = words[2]
-            target = words[0].split('.')[1]
-            if query not in qids:
-                qids.append(query)
-                hids.append(target)
+            target = _cluster_number_from_name(words[0], "HMMER")
+            if query not in clusters_by_query:
+                clusters_by_query[query] = target
 
     # search each of the fragment ids in the qids list to find a match
     # get the first match as HMM search sorted the output based on best match
-    handle = open('frag.noBlast.fas','r')
-    for seq in SeqIO.parse(handle,'fasta'):
-        if seq.id in qids: # if the id matched
-            ind = qids.index(seq.id)
-            fh.write("%s\t%s\n" %(seq.id,hids[ind]))
+    with open('frag.ClusterList.txt','a') as cluster_handle:
+        with open('frag.noBlast.fas','r') as handle:
+            for seq in SeqIO.parse(handle,'fasta'):
+                if seq.id in clusters_by_query: # if the id matched
+                    cluster_handle.write("%s\t%s\n" %(seq.id, clusters_by_query[seq.id]))
 
-    fh.close()
-
-    return len(qids)
+    return len(clusters_by_query)
 
 #**********************************************************************
 
@@ -1833,10 +2050,11 @@ def assignClusterstoFrags(numClusters,numFrag,mArgs):
 
             noMatchFrags = [] # hold fragments not matching in BLAST
 
-            handle = open('frag.fas','r')
-            for seq in SeqIO.parse(handle,'fasta'):
-                if seq.id not in mIds:
-                    noMatchFrags.append(seq)
+            matched_ids = set(mIds)
+            with open('frag.fas','r') as handle:
+                for seq in SeqIO.parse(handle,'fasta'):
+                    if seq.id not in matched_ids:
+                        noMatchFrags.append(seq)
 
             if len(noMatchFrags) > 0:
                 SeqIO.write(noMatchFrags,'frag.noBlast.fas','fasta')
@@ -1860,50 +2078,38 @@ def assignClusterstoFrags(numClusters,numFrag,mArgs):
 
 def addFragmentToClustersGNUParallel(nClusters,log,mArgs):
     '''
-        add fragments to clusters using GNU parallel
+        Add fragments concurrently using Python-managed subprocesses.
+
+        The legacy function name is retained for API compatibility.
     '''
 
     msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
     msg += ' Adding fragments to long sequence clusters\n'
     print(msg)
 
-    # get number of clusters for bash running
-    numClusters = nClusters - 1
+    tasks = _fragment_alignment_tasks(nClusters)
+    if not tasks:
+        return
 
-    # create bash script for running MAFFT --addfragment
-    pStr = '#!/bin/bash\n\n'
-    pStr += 'my_func(){\n\n'
+    def worker(task, threads_per_job):
+        source, fragments, destination, cluster = task
+        if fragments is None:
+            records = _validate_fasta_artifact(source, "cluster alignment", alignment=True)
+            _copy_fasta(
+                source, destination, expected_ids=[record.id for record in records]
+            )
+        else:
+            addFragments(
+                fragments,
+                source,
+                destination,
+                threads_per_job,
+                mArgs.mIterL,
+                log,
+                cluster,
+            )
 
-    pStr += '\tinF="frag.$1.fas"\n\n'
-    pStr += '\tif [ -a $inF ]\n' # file present
-    pStr += '\tthen\n'
-    pStr += '\t\tmafft --preservecase --thread %s --maxiterate %s --addfragments $inF long.$1.aln > cls.$1.aln\n' % (mArgs.thread,mArgs.mIterL)
-    pStr += '\telse\n'
-    pStr += '\t\tcat long.$1.aln > cls.$1.aln\n'
-    pStr += '\tfi\n\n'
-    pStr += '}\n\n'
-
-    pStr += 'export -f my_func\n\n'
-    pStr += 'parallel -j 2 my_func ::: $(seq 0 1 %d) ::: %s ::: %s' % (numClusters,mArgs.thread,mArgs.mIterL)
-
-    il = open('fragAlign.sh','w')
-    il.write(pStr)
-    il.close()
-
-    # assign executable permission to the file
-    st = os.stat('fragAlign.sh')
-    os.chmod('fragAlign.sh', st.st_mode | stat.S_IEXEC)
-
-    # subprocess call to run mafft in parallel
-    script = ['./fragAlign.sh']
-
-    fh = open(log,'a')
-
-    try:
-        subprocess.check_call(script,stderr=fh,stdout=fh)
-    except OSError as e:
-        print(e)
-        #cZip(cDir,tName,zName)
+    _run_threaded(tasks, worker, mArgs.thread)
 
 
 #************************************************************************
@@ -1917,21 +2123,29 @@ def addFragments(fName,aName,oName,thread,mIterL,log,p=None):
     else:
         lName = log + '.temp'
 
-    lh = open(lName,'a')
-    ah = open(oName,'w')
+    fragment_records = _validate_fasta_artifact(fName, "MAFFT fragment input")
+    alignment_records = _validate_fasta_artifact(aName, "MAFFT alignment input", alignment=True)
+    expected_ids = [record.id for record in alignment_records + fragment_records]
+    expected_ungapped = _record_sequences(alignment_records + fragment_records)
+    if _reusable_fasta(
+        oName,
+        alignment=True,
+        expected_ids=expected_ids,
+        expected_ungapped=expected_ungapped,
+    ):
+        return
 
     cl = ['mafft', '--preservecase', '--thread', str(thread), '--maxiterate', str(mIterL), '--addfragments', fName, aName]
 
-    try:
+    with open(lName, 'a') as lh, open(oName, 'w') as ah:
         subprocess.check_call(cl,stdout=ah,stderr=lh)
-    except subprocess.CalledProcessError as e:
-        lh.close()
-        ah.close()
-        print(e)
-        #cZip(cDir,tName,zName)
-
-    lh.close()
-    ah.close()
+    _validate_fasta_artifact(
+        oName,
+        "MAFFT fragment alignment",
+        alignment=True,
+        expected_ids=expected_ids,
+        expected_ungapped=expected_ungapped,
+    )
 
     if not p:
         concatLogFiles('pipelign.log',lName)
@@ -1950,27 +2164,65 @@ def addFragmentToClustersJoblibParallel(nClusters,log,thread,mIterL):
     msg += ' Adding fragments to long sequence clusters\n'
     print(msg)
 
-    # Fork the worker processes to perform computation concurrently
-    # Create parameter map
-    aln = lambda i : ('long.' + str(i) + '.aln', 'frag.' + str(i) + '.fas', 'cls.' + str(i) + '.aln')
+    tasks = _fragment_alignment_tasks(nClusters)
+    if not tasks:
+        return
+    jobs, threads_per_job = _parallel_worker_plan(len(tasks), thread)
 
-    to_run_tuples = list(map(aln, range(nClusters)))
-    to_run_addfragment = list(filter(lambda x : os.path.exists(x[1]) and os.stat(x[1]).st_size > 0, to_run_tuples)) # fragments present for that cluster
-    to_copy = list(filter(lambda x : not(os.path.exists(x[1]) and os.stat(x[1]).st_size > 0), to_run_tuples)) # no fragment for that cluster
+    def run_task(task):
+        source, fragments, destination, cluster = task
+        if fragments is None:
+            records = _validate_fasta_artifact(source, "cluster alignment", alignment=True)
+            _copy_fasta(
+                source, destination, expected_ids=[record.id for record in records]
+            )
+        else:
+            addFragments(
+                fragments, source, destination, threads_per_job, mIterL, log, cluster
+            )
 
-    # run in parallel
-    if len(to_run_addfragment):
-        num_parallel_jobs = int(nClusters/thread) if nClusters > thread else thread
-        num_threads_per_job = int(thread/nClusters) if thread > nClusters else 1
-        joblib.Parallel(n_jobs=num_parallel_jobs)(joblib.delayed(addFragments)(x[1],x[0],x[2],num_threads_per_job,mIterL,log,x[0].split('.')[1]) for x in to_run_addfragment)
-
-    if len(to_copy):
-        num_parallel_jobs = math.ceil(len(to_copy)/thread) if nClusters < thread else thread
-        joblib.Parallel(n_jobs=num_parallel_jobs)(joblib.delayed(shutil.copyfile)(x[0],x[2]) for x in to_copy)
+    joblib.Parallel(n_jobs=jobs, prefer="threads")(
+        joblib.delayed(run_task)(task) for task in tasks
+    )
 
     msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
     msg += ' Finished adding fragments to long sequence clusters. Created files: <cls.x.aln>\n'
     print(msg)
+
+#************************************************************************
+
+def _fragment_alignment_tasks(nClusters):
+    tasks = []
+    for cluster in range(nClusters):
+        source = 'long.' + str(cluster) + '.aln'
+        fragment_path = 'frag.' + str(cluster) + '.fas'
+        fragments = (
+            fragment_path
+            if os.path.isfile(fragment_path) and os.path.getsize(fragment_path) > 0
+            else None
+        )
+        destination = 'cls.' + str(cluster) + '.aln'
+        source_records = _validate_fasta_artifact(
+            source, "cluster alignment", alignment=True
+        )
+        expected_ids = [record.id for record in source_records]
+        expected_ungapped = _record_sequences(source_records)
+        if fragments is not None:
+            fragment_records = _validate_fasta_artifact(
+                fragments, "fragment cluster"
+            )
+            expected_ids.extend(record.id for record in fragment_records)
+            expected_ungapped.update(_record_sequences(fragment_records))
+        if _reusable_fasta(
+            destination,
+            alignment=True,
+            expected_ids=expected_ids,
+            expected_ungapped=expected_ungapped,
+        ):
+            continue
+        tasks.append((source, fragments, destination, str(cluster)))
+    return tasks
+
 
 #************************************************************************
 def excludeClustersFromalignment(oAln,xAln):
@@ -2020,24 +2272,24 @@ def excludeClustersFromalignment(oAln,xAln):
     msg += ' Removing sequences from final alignment\n'
     print(msg)
 
-    if len(exList) > 0:
-        # check if original alignment file exists, read alignment
-        if checkPresenceOfFile(oAln):
-            aln = list(SeqIO.parse(oAln,'fasta'))
-        else:
-            print('\nOriginal alignment file not found. Pipelign is exiting')
-            #cZip(cDir,tFileName,zName)
+    if len(exList) == 0:
+        print('No matching clusters selected for exclusion')
+        copyFile(oAln, xAln)
+        return
 
-        # create a list of allowed sequences
-        aSeq = list()
-        for seq in aln:
-            if seq.id not in exList:
-                aSeq.append(seq)
+    if not checkPresenceOfFile(oAln):
+        raise PipelignError('Original alignment file not found')
+    aln = list(SeqIO.parse(oAln,'fasta'))
 
-        msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
-        msg += ' Writing new alignment file after removing sequences\n'
-        print(msg)
-        SeqIO.write(aSeq,xAln,'fasta')
+    excluded = set(exList)
+    aSeq = [seq for seq in aln if seq.id not in excluded]
+    if not aSeq:
+        raise PipelignError('Cluster exclusion would remove every sequence')
+
+    msg = '[' + time.strftime('%d %b %H:%M:%S') + ']'
+    msg += ' Writing new alignment file after removing sequences\n'
+    print(msg)
+    SeqIO.write(aSeq,xAln,'fasta')
 
 #************************************************************************
 # this is to check duplicate values for the same argument
@@ -2090,11 +2342,11 @@ def validateAlphabet(parser,alphabet):
 def validateRunType(parser,run):
     '''
     raises exception if run type is given multiple times
-    if no value is given, GNU parallel is used by default
+    if no value is given, the built-in subprocess executor is used by default
 
     '''
     if run == None:
-        print("== No value given for '-r', using (G)NU parallel")
+        print("== No value given for '-r', using built-in concurrent mode (G)")
         return 'G'
     elif len(run) == 1:
         #x = run[0].upper()
@@ -2182,10 +2434,12 @@ def validateThread(parser,threads):
         print("== No value given for '-q', running on a single CPU")
         return 1
     elif len(threads) == 1:
+        if threads[0] < 1:
+            parser.error('value given for -q must be a positive integer')
         numThreads = os.cpu_count()
         #print(numThreads,threads)
-        if numThreads == None or threads[0] == 0:
-            return 1
+        if numThreads == None:
+            return threads[0]
         elif numThreads >= threads[0]:
             #print(threads[0])
             return threads[0]
@@ -2204,6 +2458,8 @@ def validateIterateMerge(parser,mergeIter):
         print("== No value given for '-m', running only 1 iterations during merge")
         return 1
     elif len(mergeIter) == 1:
+        if mergeIter[0] < 1:
+            parser.error('value given for -m must be a positive integer')
         return mergeIter[0]
     else:
         parser.error('-m appears several times')
@@ -2217,6 +2473,8 @@ def validateIterateLong(parser,longIter):
         print("== No value given for '-s', running only 1 iterations during aligning long sequence clusters")
         return 1
     elif len(longIter) == 1:
+        if longIter[0] < 1:
+            parser.error('value given for -s must be a positive integer')
         return longIter[0]
     else:
         parser.error('-s appears several times')
@@ -2238,8 +2496,9 @@ def getArguments(argv=None):
     parser.add_argument('-f', '--keepOrphans', help='Add fragments without clusters', action="store_true")
     parser.add_argument('-b', '--keepBadSeqs', help='Add long sequences with too many ambiguous residues', action="store_true")
     parser.add_argument('-z', '--mZip', help='Create zipped intermediate output files', action="store_true")
+    parser.add_argument('--resume', help='Resume a compatible run from its completed checkpoints', action="store_true")
     parser.add_argument('-p', '--simPer', type=float,help="Percent sequence similarity for clustering (default: 0.8)", action='append')
-    parser.add_argument('-r', '--run', help="Run either (J)oblib/(G)NU parallel version (default: G)", choices=['J','G'],action='append')
+    parser.add_argument('-r', '--run', help="Run either (J)oblib or built-in concurrent mode (G, default)", choices=['J','G'],action='append')
     parser.add_argument('-e', '--merge', help="Merge using (P)arallel/(C)onsensus strategy  (default: P)", choices=['P','C'],action='append')
     parser.add_argument('-q', '--thread', type=int, help="Number of CPU/threads to use (default: 1)", action='append')
     parser.add_argument('-s', '--mIterateLong', type=int, help="Number of iterations to refine long alignments (default: 1)", action='append')

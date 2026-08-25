@@ -15,7 +15,7 @@ _COPILOT_HOME_ENV = "PIPELIGN_COPILOT_HOME"
 
 SKILL_CONTENT = """---
 name: pipelign
-description: Use for pipelign workflows: automated multiple sequence alignment, FASTA/GenBank preprocessing, bioinformatics dependency checks, and troubleshooting MAFFT/CD-HIT/IQ-TREE/HMMER/BLAST/GNU parallel installs.
+description: Use for pipelign workflows: automated multiple sequence alignment, FASTA/GenBank preprocessing, bioinformatics dependency checks, and troubleshooting MAFFT/CD-HIT/IQ-TREE/HMMER/BLAST installs.
 argument-hint: "[alignment task or pipelign troubleshooting request]"
 user-invocable: true
 compatibility: Requires the pipelign CLI on PATH or a pipelign repository checkout.
@@ -37,7 +37,7 @@ Manual invocation is available as `/pipelign`.
    - Repository checkout: `uvx --no-cache --from . pipelign --help`
 2. Confirm the user's intended alphabet, run mode, and stage.
    - Alphabet: `dna`, `rna`, or `aa`
-   - Run mode: `G` for GNU parallel, `J` for Joblib
+   - Run mode: `G` for built-in concurrency, `J` for Joblib
    - Stage: `1` through `5`
 3. Check external executables with the same settings you will use for the run:
    ```bash
@@ -54,7 +54,7 @@ Manual invocation is available as `/pipelign`.
 5. Install external bioinformatics binaries separately from conda-forge/bioconda:
    ```bash
    micromamba create -n pipelign -c conda-forge -c bioconda \
-     python=3.12 mafft hmmer cd-hit iqtree blast parallel
+     python=3.12 mafft hmmer cd-hit iqtree blast
    micromamba activate pipelign
    ```
 6. Start with a small input and explicit output paths:
@@ -66,11 +66,11 @@ Manual invocation is available as `/pipelign`.
 ## Agent safety rules
 
 - Do not assume the Python package install includes MAFFT, HMMER, CD-HIT,
-  IQ-TREE, BLAST, or GNU parallel. They are external executables.
+  IQ-TREE, or BLAST. They are external executables.
 - Run `pipelign-doctor` before invoking the full pipeline unless the user asks
   to skip checks.
 - Use the user's intended `-a`, `-r`, and `-n` values in doctor checks.
-- Prefer `-r J` if GNU parallel is unavailable and the user accepts Joblib mode.
+- Prefer `-r G` for bounded built-in concurrency or `-r J` for Joblib.
 - Keep experiments in an explicit working directory via `-d`.
 - Do not overwrite an existing intermediate directory unless the user asks for
   `--clearExistingDirectory`.
@@ -83,7 +83,7 @@ Manual invocation is available as `/pipelign`.
 | Check Joblib-only stage 1 dependencies | `pipelign-doctor -a dna -r J -n 1` |
 | Convert GenBank to FASTA | `gb2fas input.gb output.fasta` |
 | Run a DNA alignment | `pipelign -i input.fasta -o aligned.fasta -d work -a dna -r G -n 5` |
-| Run without GNU parallel | `pipelign -i input.fasta -o aligned.fasta -d work -a dna -r J -n 5` |
+| Run with Joblib | `pipelign -i input.fasta -o aligned.fasta -d work -a dna -r J -n 5` |
 
 ## External tool packages
 
@@ -94,7 +94,6 @@ Manual invocation is available as `/pipelign`.
 | `cd-hit`, `cd-hit-est` | `cd-hit` | Sequence clustering |
 | `iqtree` or `iqtree2` | `iqtree` | Phylogenetic tree inference |
 | `makeblastdb`, `blastn`, `blastp` | `blast` | Fragment-to-cluster assignment |
-| `parallel` | `parallel` | GNU parallel execution for `-r G` |
 
 ## Reporting back
 

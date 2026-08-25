@@ -10,17 +10,49 @@
     Returns a FASTA formatted alignment file
 
     Different flavours are present:
-        - GNU Parallel for Linux and MacOS
+        - Built-in subprocess concurrency
         - Joblib for Linux, MacOS and Windows
 '''
 
 #*********************************************************************
 
 import sys, os, shutil, subprocess, argparse, textwrap, stat, time
+from glob import glob
 from pipelign import *
+from pipelign import _validate_fasta_artifact
+from pipelign.reporting import RunReport
 from pipelign.skill import skill_main
 
-def main(argv=None):
+_active_report = None
+
+
+def _record_alignment_summary(path, clusters=None, fragments=None):
+    records = _validate_fasta_artifact(path, "final alignment", alignment=True)
+    details = {
+        "final_sequences": len(records),
+        "alignment_columns": len(records[0].seq),
+    }
+    if clusters is not None:
+        details["clusters"] = clusters
+    if fragments is not None:
+        details["fragments"] = fragments
+    _active_report.update_summary(**details)
+
+
+def _artifact_paths(*patterns):
+    return sorted(
+        {
+            path
+            for pattern in patterns
+            for path in glob(pattern)
+            if os.path.isfile(path)
+        }
+    )
+
+
+def _pipeline_main(argv=None):
+    global _active_report
+    configure_resume(False)
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv and argv[0] == "skill":
         return skill_main(argv[1:])
@@ -52,7 +84,8 @@ def main(argv=None):
         merge = args.merge.upper(),
         cFlag = args.clearExistingDirectory,
         stage = args.stage,
-        excludeClusters = args.excludeClusters)
+        excludeClusters = args.excludeClusters,
+        resume = args.resume)
 
     '''
     # check whether input file exists
@@ -84,8 +117,30 @@ def main(argv=None):
     '''
     oName = mArgs.outDir
 
-    # create intermediate directory
-    makeOutDir(oName,mArgs.cFlag)
+    if mArgs.resume:
+        if not os.path.isdir(oName):
+            sys.exit("\nERROR: Cannot resume because output directory <%s> does not exist\n" % oName)
+        _active_report = RunReport.resume(
+            output_dir=os.path.abspath(oName),
+            input_path=os.path.abspath(mArgs.inFile),
+            output_path=mArgs.outFile,
+            arguments=vars(args),
+            archive=mArgs.makeZip,
+        )
+    else:
+        makeOutDir(oName,mArgs.cFlag)
+        _active_report = RunReport(
+            output_dir=os.path.abspath(oName),
+            input_path=os.path.abspath(mArgs.inFile),
+            output_path=mArgs.outFile,
+            arguments=vars(args),
+            tools=required_external_tools(mArgs.alphabet, mArgs.run, mArgs.stage),
+            archive=mArgs.makeZip,
+        )
+    configure_resume(
+        mArgs.resume,
+        _active_report.artifact_checksums() if mArgs.resume else None,
+    )
 
     # create temporary directory
     #tempDir, tDirName = makeTempDir(mArgs.tempDirPath,zName)
@@ -99,7 +154,7 @@ def main(argv=None):
     msg += ' Pipelign started with sequence file <%s>\n' % mArgs.inFile
     print(msg)
 
-    with open(os.path.join(oName,'pipelign.log'),'w') as oh:
+    with open(os.path.join(oName,'pipelign.log'),'a') as oh:
         oh.write(msg)
 
     # change current working directory to the output directory
@@ -120,9 +175,21 @@ def main(argv=None):
 
     # create separate files for each cluster
     numClusters = makeClusters(mArgs.longName,'grp.clstr')
-
     # add cluster numbers and size to header
     addClusterNumberToReps('grp','long.ClusterList.txt','clsReps.fas')
+    _active_report.checkpoint(
+        "clustering",
+        clusters=numClusters,
+        fragments=numFrag,
+        artifacts=_artifact_paths(
+            "grp",
+            "grp.clstr",
+            "long.ClusterList.txt",
+            "clsReps.fas",
+            "long.*.fas",
+            "long.good.fas",
+        ),
+    )
 
 
     if numClusters < 3: # less than 3 clusters, tree will not be built
@@ -175,7 +242,7 @@ def main(argv=None):
     print(msg)
 
     # align long sequence clusters and create <long.xx.aln> files
-    if mArgs.run == 'G': # run GNU parallel version
+    if mArgs.run == 'G': # run built-in concurrent version
         alnLongSequenceClustersGNUParallel(numClusters,mArgs.thread,mArgs.mIterL)
 
     elif mArgs.run == 'J':
@@ -183,6 +250,16 @@ def main(argv=None):
 
     # make HMMs and database from long sequence cluster alignments
     makeHMMdbParallel(numClusters,mArgs.thread,mArgs.alphabet,'hmmer.log')
+    _active_report.checkpoint(
+        "cluster_alignments_and_hmms",
+        clusters=numClusters,
+        artifacts=_artifact_paths(
+            "long.*.aln",
+            "long.*.hmm",
+            "pipelign.hmm*",
+            "clsReps.aln*",
+        ),
+    )
 
     msg = '\nAlignment files and HMMs can be found in <%s>\n' % oName
     msg += '\tLong sequence alignments have names <long.xx.aln>\n'
@@ -195,25 +272,6 @@ def main(argv=None):
     #***************
     # only create long sequence cluster alignments and HMMs and exit
     if mArgs.stage == 1:
-        '''
-        longSeqClusters(mArgs.tempDirPath,cDir,zName,tDirName,tFileName)
-
-        # No path provided for temporary directory
-        if mArgs.tempDirPath is None:
-            try:
-                wName = cDir + '/' + zName
-                shutil.copytree(tDirName,wName)
-                os.chdir(cDir)
-                os.chmod(zName,0o777)
-            except OSError as e:
-                print(e)
-                cZip(cDir,tFileName,zName)
-
-        if mArgs.tempDirPath:
-            os.chdir(cDir)
-            if os.path.exists(zName):
-                os.chmod(zName,0o777)
-        '''
         print('\nThank you for using Pipelign.\n')
         sys.exit(0)
 
@@ -232,29 +290,14 @@ def main(argv=None):
         else:
             copyFile('final.all.aln','final.aln')
 
-        if checkPresenceOfFile('final.aln'):
-            copyFile('final.aln',mArgs.outFile)
+        if not checkPresenceOfFile('final.aln'):
+            raise PipelignError('Stage 2 did not produce <final.aln>')
+        publishAlignment('final.aln',mArgs.outFile)
+        _record_alignment_summary('final.aln', numClusters, numFrag)
 
-
-        if checkPresenceOfFile(mArgs.outFile):
-            msg = '\n[' + time.strftime('%d %b %H:%M:%S') + ']'
-            msg += ' Final alignment written in <%s>\n' % mArgs.outFile
-            print(msg)
-        else:
-            msg = '\n[' + time.strftime('%d %b %H:%M:%S') + ']'
-            msg += ' Pipelign could not write the file <%s>\n' % mArgs.outFile
-            msg += '\tSomething went wrong. Please check the output directory.\n'
-            print(msg)
-
-        # give permission to output alignment to user; used mainly for Docker
-        if checkPresenceOfFile(mArgs.outFile):
-            os.chmod(mArgs.outFile, 0o777)
-        '''
-        if mArgs.tempDirPath:
-            os.chdir(cDir)
-            if os.path.exists(zName):
-                os.chmod(zName,0o777)
-        '''
+        msg = '\n[' + time.strftime('%d %b %H:%M:%S') + ']'
+        msg += ' Final alignment written in <%s>\n' % mArgs.outFile
+        print(msg)
 
         print('\nThank you for using Pipelign.\n')
         sys.exit(0)
@@ -267,11 +310,21 @@ def main(argv=None):
         if not checkPresenceOfFile('frag.fas'):
             msg += '\nFragment file <frag.fas> does not exist. No fragments found for assigning clusters.\n'
             print(msg)
-            with open('pipeline.log', 'a') as oh:
+            with open('pipelign.log', 'a') as oh:
                 oh.write(msg)
 
         else:
             assignClusterstoFrags(numClusters,numFrag,mArgs)
+            _active_report.checkpoint(
+                "fragment_assignment",
+                fragments=numFrag,
+                artifacts=_artifact_paths(
+                    "frag.ClusterList.txt",
+                    "frag.*.fas",
+                    "frag.blast.txt",
+                    "hmm.out",
+                ),
+            )
 
             msg += '\tCluster files for fragments are written in <frag.xx.fas>\n'
 
@@ -287,12 +340,22 @@ def main(argv=None):
         if not checkPresenceOfFile('frag.fas'):
             msg += '\nFragment file <frag.fas> does not exist. No fragments found for assigning clusters.'
             print(msg)
-            with open('pipeline.log', 'a') as oh:
+            with open('pipelign.log', 'a') as oh:
                 oh.write(msg)
 
 
         else:
             assignClusterstoFrags(numClusters,numFrag,mArgs)
+            _active_report.checkpoint(
+                "fragment_assignment",
+                fragments=numFrag,
+                artifacts=_artifact_paths(
+                    "frag.ClusterList.txt",
+                    "frag.*.fas",
+                    "frag.blast.txt",
+                    "hmm.out",
+                ),
+            )
 
             if mArgs.run == 'G':
                 addFragmentToClustersGNUParallel(numClusters,'fragAlign.log',mArgs)
@@ -304,7 +367,7 @@ def main(argv=None):
             msg += '\tCluster alignments are written in <cls.xx.aln>\n'
 
             print(msg)
-            with open('pipeline.log', 'a') as oh:
+            with open('pipelign.log', 'a') as oh:
                 oh.write(msg)
 
 
@@ -320,14 +383,24 @@ def main(argv=None):
         if not checkPresenceOfFile('frag.fas'):
             msg += '\nFragment file <frag.fas> does not exist. No fragments found for assigning clusters.'
             print(msg)
-            with open('pipeline.log', 'a') as oh:
+            with open('pipelign.log', 'a') as oh:
                 oh.write(msg)
 
         else:
             assignClusterstoFrags(numClusters,numFrag,mArgs)
+            _active_report.checkpoint(
+                "fragment_assignment",
+                fragments=numFrag,
+                artifacts=_artifact_paths(
+                    "frag.ClusterList.txt",
+                    "frag.*.fas",
+                    "frag.blast.txt",
+                    "hmm.out",
+                ),
+            )
             msg = 'Cluster files for fragments are written in <frag.xx.fas>\n'
             print(msg)
-            with open('pipeline.log', 'a') as oh:
+            with open('pipelign.log', 'a') as oh:
                 oh.write(msg)
 
 
@@ -335,11 +408,16 @@ def main(argv=None):
             addFragmentToClustersGNUParallel(numClusters,'fragAlign.log',mArgs)
         elif mArgs.run == 'J':
             addFragmentToClustersJoblibParallel(numClusters,'fragAlign.log',mArgs.thread,mArgs.mIterL)
+        _active_report.checkpoint(
+            "fragment_alignments",
+            clusters=numClusters,
+            artifacts=_artifact_paths("cls.*.aln"),
+        )
 
         msg = '\n[' + time.strftime('%d %b %H:%M:%S') + ']'
         msg += ' Cluster alignments are written in <cls.xx.aln>\n'
         print(msg)
-        with open('pipeline.log', 'a') as oh:
+        with open('pipelign.log', 'a') as oh:
             oh.write(msg)
 
 
@@ -413,22 +491,27 @@ def main(argv=None):
             copyFile('final.all.aln','final.aln')
 
         if checkPresenceOfFile('final.aln'):
-            copyFile('final.aln',mArgs.outFile)
+            publishAlignment('final.aln',mArgs.outFile)
 
         if checkPresenceOfFile(mArgs.outFile):
             msg = '\n[' + time.strftime('%d %b %H:%M:%S') + ']'
             msg += ' Final alignment written in <%s>\n' % mArgs.outFile
             print(msg)
 
-            # give permission to output file; for docker
-            os.chmod(mArgs.outFile,0o777)
+            _active_report.checkpoint(
+                "final_alignment",
+                output=mArgs.outFile,
+                artifacts=_artifact_paths(
+                    "final.aln",
+                    "final.all.aln",
+                    "final.noOrphans.aln",
+                    "final.noBadSeq.aln",
+                ),
+            )
+            _record_alignment_summary('final.aln', numClusters, numFrag)
 
             # change to parent directory
             os.chdir(cDir)
-
-            # give permission to temporary directory
-            if os.path.isdir(oName):
-                os.chmod(oName,0o777)
 
         else:
             msg = '\n[' + time.strftime('%d %b %H:%M:%S') + ']'
@@ -441,6 +524,33 @@ def main(argv=None):
 
         print('\nThank you for using Pipelign.\n')
         sys.exit(0)
+
+
+def main(argv=None):
+    global _active_report
+    _active_report = None
+    original_cwd = os.getcwd()
+    try:
+        return _pipeline_main(argv)
+    except SystemExit as exc:
+        if _active_report is not None:
+            code = exc.code if isinstance(exc.code, int) else 1
+            try:
+                _active_report.finish(
+                    "success" if code == 0 else "failed",
+                    None if code == 0 else str(exc),
+                )
+            except Exception as finish_exc:
+                print("pipelign: error: %s" % finish_exc, file=sys.stderr)
+                raise SystemExit(1) from finish_exc
+        raise
+    except Exception as exc:
+        if _active_report is not None:
+            _active_report.finish("failed", "%s: %s" % (type(exc).__name__, exc))
+        print("pipelign: error: %s" % exc, file=sys.stderr)
+        return 1
+    finally:
+        os.chdir(original_cwd)
 
 
 if __name__=="__main__":
